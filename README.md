@@ -1,6 +1,6 @@
 # pebble-yes-watch
 
-A Pebble SDK 3 watchface inspired by the **YES Watch** style: 24‑hour dial, day/night sector, moon phase disk, and a moon up/down ring (moonrise→moonset).
+A Pebble SDK 3 watchface inspired by the **YES Watch** style (see [https://yeswatch.com/](https://yeswatch.com/)): 24‑hour dial, day/night sector, moon phase disk, and a moon up/down ring (moonrise→moonset).
 
 The project is designed to run well on both **color** and **black/white** Pebble models and to work in a **hybrid** mode:
 
