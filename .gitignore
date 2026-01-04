@@ -1,0 +1,10 @@
+.DS_Store
+.lock-waf_*
+build/
+node_modules/
+
+# Editor/OS noise
+.vscode/
+.idea/
+*.swp
+

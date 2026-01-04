@@ -1,0 +1,43 @@
+{
+  "name": "pebble-yes-watch",
+  "author": "Andreas Pehnack",
+  "version": "1.0.0",
+  "keywords": ["yes watch", "moon phase", "sunrise", "sunset"],
+  "private": true,
+  "dependencies": {},
+  "pebble": {
+    "displayName": "Yes Watch",
+    "uuid": "675b6d76-bf93-4f31-9eda-9e091ca711b5",
+    "sdkVersion": "3",
+    "enableMultiJS": true,
+    "targetPlatforms": [
+      "basalt",
+      "chalk",
+      "diorite",
+      "emery",
+      "flint"
+    ],
+    "watchapp": {
+      "watchface": true
+    },
+    "messageKeys": [
+      "KEY_REQUEST_LOC",
+      "KEY_LAT_E6",
+      "KEY_LON_E6",
+      "KEY_TZ_OFFSET_MIN",
+      "KEY_LOC_UNIX",
+
+      "KEY_HOME_SUN_STATE",
+      "KEY_HOME_SUNRISE_MIN",
+      "KEY_HOME_SUNSET_MIN",
+      "KEY_HOME_MOON_STATE",
+      "KEY_HOME_MOONRISE_MIN",
+      "KEY_HOME_MOONSET_MIN",
+      "KEY_MOON_PHASE_E6",
+      "KEY_USE_INTERNET_FALLBACK"
+    ],
+    "resources": {
+      "media": []
+    }
+  }
+}

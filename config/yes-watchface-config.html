@@ -1,0 +1,159 @@
+<!doctype html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>YES Watchface</title>
+  <style>
+    body { font-family: -apple-system, system-ui, sans-serif; margin: 16px; }
+    .row { margin: 12px 0; }
+    label { display: block; font-weight: 600; margin-bottom: 6px; }
+    input { width: 100%; padding: 10px; font-size: 16px; box-sizing: border-box; }
+    button { width: 100%; padding: 12px; font-size: 16px; margin-top: 10px; }
+    .hint { font-size: 12px; color: #555; }
+  </style>
+</head>
+<body>
+  <h2>Home override (optional)</h2>
+  <div class="row">
+    <label><input type="checkbox" id="homeEnabled"> Override Home location</label>
+    <div class="hint">Useful in the emulator/VPN. If disabled, Home uses your phone's current location.</div>
+  </div>
+  <div class="row">
+    <label>Home Latitude (decimal degrees)</label>
+    <input id="homeLat" placeholder="e.g. 26.176807">
+  </div>
+  <div class="row">
+    <label>Home Longitude (decimal degrees)</label>
+    <input id="homeLon" placeholder="e.g. -80.171041">
+  </div>
+  <div class="row">
+    <label>Home UTC offset minutes</label>
+    <input id="homeTz" placeholder="e.g. -300 (EST), -240 (EDT)">
+  </div>
+  <button id="homeUseGps">Use my current GPS as Home</button>
+
+  <h2>Away location</h2>
+  <div class="row">
+    <label><input type="checkbox" id="awayEnabled"> Enable Away location</label>
+    <div class="hint">Away is optional.</div>
+  </div>
+  <div class="row">
+    <label>Latitude (decimal degrees)</label>
+    <input id="lat" placeholder="e.g. 48.1372">
+  </div>
+  <div class="row">
+    <label>Longitude (decimal degrees)</label>
+    <input id="lon" placeholder="e.g. 11.5756">
+  </div>
+  <div class="row">
+    <label>UTC offset minutes</label>
+    <input id="tz" placeholder="e.g. 60 (CET), -480 (PST)">
+    <div class="hint">This is a fixed offset. If you travel, update it.</div>
+  </div>
+  <button id="useGps">Use my current GPS as Away</button>
+  <button id="save">Save</button>
+
+  <script>
+    function closeWith(payload) {
+      const encoded = encodeURIComponent(JSON.stringify(payload));
+      try {
+        const params = new URLSearchParams(location.search || '');
+        const rt = params.get('return_to');
+        if (rt) { location.href = rt + encoded; return; }
+      } catch (e) {}
+      location.href = 'pebblejs://close#' + encoded;
+    }
+
+    function load() {
+      try {
+        const rawHome = localStorage.getItem('home');
+        if (rawHome) {
+          const h = JSON.parse(rawHome);
+          if (h) {
+            document.getElementById('homeEnabled').checked = !!h.valid;
+            const lat = (typeof h.lat === 'number') ? h.lat : (typeof h.latE6 === 'number' ? (h.latE6 / 1e6) : null);
+            const lon = (typeof h.lon === 'number') ? h.lon : (typeof h.lonE6 === 'number' ? (h.lonE6 / 1e6) : null);
+            if (typeof lat === 'number') document.getElementById('homeLat').value = String(lat);
+            if (typeof lon === 'number') document.getElementById('homeLon').value = String(lon);
+            if (typeof h.tzOffsetMin === 'number') document.getElementById('homeTz').value = String(h.tzOffsetMin);
+          }
+        }
+
+        const raw = localStorage.getItem('away');
+        if (!raw) return;
+        const obj = JSON.parse(raw);
+        if (!obj) return;
+        document.getElementById('awayEnabled').checked = !!obj.valid;
+        const alat = (typeof obj.lat === 'number') ? obj.lat : (typeof obj.latE6 === 'number' ? (obj.latE6 / 1e6) : null);
+        const alon = (typeof obj.lon === 'number') ? obj.lon : (typeof obj.lonE6 === 'number' ? (obj.lonE6 / 1e6) : null);
+        if (typeof alat === 'number') document.getElementById('lat').value = String(alat);
+        if (typeof alon === 'number') document.getElementById('lon').value = String(alon);
+        if (typeof obj.tzOffsetMin === 'number') document.getElementById('tz').value = String(obj.tzOffsetMin);
+      } catch (e) {}
+    }
+
+    function save() {
+      // Home
+      const homeEnabled = document.getElementById('homeEnabled').checked;
+      if (!homeEnabled) {
+        localStorage.setItem('home', JSON.stringify({ valid: false }));
+      } else {
+        const hlat = parseFloat(document.getElementById('homeLat').value);
+        const hlon = parseFloat(document.getElementById('homeLon').value);
+        const htz = parseInt(document.getElementById('homeTz').value, 10);
+        if (!isFinite(hlat) || !isFinite(hlon) || !isFinite(htz)) {
+          alert('Please enter valid Home latitude, longitude, and UTC offset minutes.');
+          return;
+        }
+        localStorage.setItem('home', JSON.stringify({ valid: true, lat: hlat, lon: hlon, tzOffsetMin: htz }));
+      }
+
+      // Away
+      const enabled = document.getElementById('awayEnabled').checked;
+      if (!enabled) {
+        localStorage.setItem('away', JSON.stringify({ valid: false }));
+        closeWith({ away: { valid: false }, home: JSON.parse(localStorage.getItem('home') || '{"valid":false}') });
+        return;
+      }
+      const lat = parseFloat(document.getElementById('lat').value);
+      const lon = parseFloat(document.getElementById('lon').value);
+      const tz = parseInt(document.getElementById('tz').value, 10);
+      if (!isFinite(lat) || !isFinite(lon) || !isFinite(tz)) {
+        alert('Please enter valid latitude, longitude, and UTC offset minutes.');
+        return;
+      }
+      const obj = { valid: true, lat: lat, lon: lon, tzOffsetMin: tz };
+      localStorage.setItem('away', JSON.stringify(obj));
+      closeWith({ away: obj, home: JSON.parse(localStorage.getItem('home') || '{"valid":false}') });
+    }
+
+    function useGps(prefix) {
+      if (!navigator.geolocation) { alert('Geolocation not available'); return; }
+      navigator.geolocation.getCurrentPosition(
+        function(pos) {
+          if (prefix === 'home') {
+            document.getElementById('homeEnabled').checked = true;
+            document.getElementById('homeLat').value = String(pos.coords.latitude);
+            document.getElementById('homeLon').value = String(pos.coords.longitude);
+            document.getElementById('homeTz').value = String(-new Date().getTimezoneOffset());
+          } else {
+            document.getElementById('awayEnabled').checked = true;
+            document.getElementById('lat').value = String(pos.coords.latitude);
+            document.getElementById('lon').value = String(pos.coords.longitude);
+            document.getElementById('tz').value = String(-new Date().getTimezoneOffset());
+          }
+        },
+        function() { alert('Failed to get GPS'); },
+        { enableHighAccuracy: false, timeout: 15000, maximumAge: 600000 }
+      );
+    }
+
+    document.getElementById('save').addEventListener('click', save);
+    document.getElementById('useGps').addEventListener('click', function(){ useGps('away'); });
+    document.getElementById('homeUseGps').addEventListener('click', function(){ useGps('home'); });
+    load();
+  </script>
+</body>
+</html>
+
+
