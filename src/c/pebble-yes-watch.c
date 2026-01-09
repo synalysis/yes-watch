@@ -15,6 +15,9 @@ int *__errno(void) {
 
 static Window *s_window;
 static Layer *s_canvas_layer;
+#ifndef PBL_ROUND
+static Layer *s_corner_layer;
+#endif
 static AppTimer *s_startup_timer;
 static bool s_debug;
 
@@ -43,6 +46,30 @@ enum {
 
   // Debug/behavior flags (sent from phone config)
   PERSIST_USE_INTERNET_FALLBACK = 140,
+
+  // Tides (US-only NOAA; phone sends data when a nearby station is within 50km)
+  PERSIST_TIDE_HAVE = 150,
+  PERSIST_TIDE_LAST_UNIX = 151,
+  PERSIST_TIDE_NEXT_UNIX = 152,
+  PERSIST_TIDE_NEXT_IS_HIGH = 153,
+  PERSIST_TIDE_LEVEL_X10 = 154,
+  PERSIST_TIDE_LEVEL_IS_FT = 155,
+
+  // Altitude (phone-provided; used as a tide alternative inland / at elevation)
+  PERSIST_ALT_VALID = 156,
+  PERSIST_ALT_M = 157,
+  PERSIST_ALT_IS_FT = 158,
+
+  // Weather (phone-provided)
+  PERSIST_WEATHER_TEMP_C10 = 160,
+  PERSIST_WEATHER_CODE = 161,
+  PERSIST_WEATHER_IS_DAY = 162,
+  PERSIST_WEATHER_IS_F = 163,
+  PERSIST_WEATHER_WIND_SPD_X10 = 164,
+  PERSIST_WEATHER_WIND_DIR_DEG = 165,
+  PERSIST_WEATHER_PRECIP_X10 = 166,
+  PERSIST_WEATHER_UV_X10 = 167,
+  PERSIST_WEATHER_PRESSURE_HPA_X10 = 168,
 };
 
 static GeoLoc s_home;
@@ -53,6 +80,51 @@ static SunTimes s_sun_home;
 static MoonTimes s_moon_home;
 static int32_t s_moon_phase_e6;
 static bool s_have_moon_phase;
+
+static bool s_have_tide;
+static int32_t s_tide_last_unix;
+static int32_t s_tide_next_unix;
+static bool s_tide_next_is_high;
+static int16_t s_tide_level_x10;
+static bool s_tide_level_is_ft;
+
+#ifndef PBL_ROUND
+static bool s_alt_valid;
+static int32_t s_alt_m;
+static bool s_alt_is_ft;
+#else
+// Avoid unused on round builds where corners are skipped.
+static bool s_alt_valid;
+static int32_t s_alt_m;
+static bool s_alt_is_ft;
+#endif
+
+// Battery alert logic: estimate time-to-empty from recent discharge rate.
+static int s_batt_last_percent = -1;
+static time_t s_batt_last_time = 0;
+static int32_t s_batt_rate_milli_per_hour = 0; // %/hour * 1000
+static bool s_batt_have_rate = false;
+static bool s_battery_alert = false;
+static uint8_t s_battery_percent = 100;
+
+static AppTimer *s_corner_timer;
+
+#ifndef PBL_ROUND
+// UI alternation timer: wake only on 5-second boundaries (rect watches only).
+static AppTimer *s_ui_timer;
+static void schedule_ui_timer(void);
+#endif
+
+static bool s_have_weather;
+static int16_t s_weather_temp_c10;
+static uint8_t s_weather_code;
+static bool s_weather_is_day;
+static bool s_weather_is_f;
+static int16_t s_weather_wind_spd_x10;
+static int16_t s_weather_wind_dir_deg;
+static int16_t s_weather_precip_x10;
+static int16_t s_weather_uv_x10;
+static int16_t s_weather_pressure_hpa_x10;
 
 static int s_last_calc_year = -1;
 static int s_last_calc_month = -1;
@@ -219,6 +291,24 @@ static void inbox_received(DictionaryIterator *iter, void *context) {
   Tuple *t_home_moonrise = dict_find(iter, MESSAGE_KEY_KEY_HOME_MOONRISE_MIN);
   Tuple *t_home_moonset = dict_find(iter, MESSAGE_KEY_KEY_HOME_MOONSET_MIN);
   Tuple *t_moon_phase = dict_find(iter, MESSAGE_KEY_KEY_MOON_PHASE_E6);
+  Tuple *t_tide_have = dict_find(iter, MESSAGE_KEY_KEY_TIDE_HAVE);
+  Tuple *t_tide_last = dict_find(iter, MESSAGE_KEY_KEY_TIDE_LAST_UNIX);
+  Tuple *t_tide_next = dict_find(iter, MESSAGE_KEY_KEY_TIDE_NEXT_UNIX);
+  Tuple *t_tide_next_is_high = dict_find(iter, MESSAGE_KEY_KEY_TIDE_NEXT_IS_HIGH);
+  Tuple *t_tide_level = dict_find(iter, MESSAGE_KEY_KEY_TIDE_LEVEL_X10);
+  Tuple *t_tide_level_is_ft = dict_find(iter, MESSAGE_KEY_KEY_TIDE_LEVEL_IS_FT);
+  Tuple *t_alt_valid = dict_find(iter, MESSAGE_KEY_KEY_ALT_VALID);
+  Tuple *t_alt_m = dict_find(iter, MESSAGE_KEY_KEY_ALT_M);
+  Tuple *t_alt_is_ft = dict_find(iter, MESSAGE_KEY_KEY_ALT_IS_FT);
+  Tuple *t_w_temp = dict_find(iter, MESSAGE_KEY_KEY_WEATHER_TEMP_C10);
+  Tuple *t_w_code = dict_find(iter, MESSAGE_KEY_KEY_WEATHER_CODE);
+  Tuple *t_w_day  = dict_find(iter, MESSAGE_KEY_KEY_WEATHER_IS_DAY);
+  Tuple *t_w_f    = dict_find(iter, MESSAGE_KEY_KEY_WEATHER_IS_F);
+  Tuple *t_w_wind_spd = dict_find(iter, MESSAGE_KEY_KEY_WEATHER_WIND_SPD_X10);
+  Tuple *t_w_wind_dir = dict_find(iter, MESSAGE_KEY_KEY_WEATHER_WIND_DIR_DEG);
+  Tuple *t_w_precip = dict_find(iter, MESSAGE_KEY_KEY_WEATHER_PRECIP_X10);
+  Tuple *t_w_uv = dict_find(iter, MESSAGE_KEY_KEY_WEATHER_UV_X10);
+  Tuple *t_w_p = dict_find(iter, MESSAGE_KEY_KEY_WEATHER_PRESSURE_HPA_X10);
   Tuple *t_use_internet = dict_find(iter, MESSAGE_KEY_KEY_USE_INTERNET_FALLBACK);
 
   bool changed = false;
@@ -268,6 +358,111 @@ static void inbox_received(DictionaryIterator *iter, void *context) {
     changed = true;
   }
 
+  if (t_tide_have) {
+    s_have_tide = (t_tide_have->value->uint8 != 0);
+    persist_write_int(PERSIST_TIDE_HAVE, s_have_tide ? 1 : 0);
+    changed = true;
+  }
+  if (t_tide_last) {
+    s_tide_last_unix = (int32_t)t_tide_last->value->int32;
+    if (s_tide_last_unix < 0) s_tide_last_unix = 0;
+    persist_write_int(PERSIST_TIDE_LAST_UNIX, s_tide_last_unix);
+    changed = true;
+  }
+  if (t_tide_next) {
+    s_tide_next_unix = (int32_t)t_tide_next->value->int32;
+    if (s_tide_next_unix < 0) s_tide_next_unix = 0;
+    persist_write_int(PERSIST_TIDE_NEXT_UNIX, s_tide_next_unix);
+    changed = true;
+  }
+  if (t_tide_next_is_high) {
+    s_tide_next_is_high = (t_tide_next_is_high->value->uint8 != 0);
+    persist_write_int(PERSIST_TIDE_NEXT_IS_HIGH, s_tide_next_is_high ? 1 : 0);
+    changed = true;
+  }
+  if (t_tide_level) {
+    s_tide_level_x10 = (int16_t)t_tide_level->value->int32;
+    persist_write_int(PERSIST_TIDE_LEVEL_X10, s_tide_level_x10);
+    changed = true;
+  }
+  if (t_tide_level_is_ft) {
+    s_tide_level_is_ft = (t_tide_level_is_ft->value->uint8 != 0);
+    persist_write_int(PERSIST_TIDE_LEVEL_IS_FT, s_tide_level_is_ft ? 1 : 0);
+    changed = true;
+  }
+
+  if (t_alt_valid) {
+    s_alt_valid = (t_alt_valid->value->uint8 != 0);
+    persist_write_int(PERSIST_ALT_VALID, s_alt_valid ? 1 : 0);
+    changed = true;
+  }
+  if (t_alt_m) {
+    s_alt_m = (int32_t)t_alt_m->value->int32;
+    persist_write_int(PERSIST_ALT_M, (int)s_alt_m);
+    changed = true;
+  }
+  if (t_alt_is_ft) {
+    s_alt_is_ft = (t_alt_is_ft->value->uint8 != 0);
+    persist_write_int(PERSIST_ALT_IS_FT, s_alt_is_ft ? 1 : 0);
+    changed = true;
+  }
+
+  if (t_w_temp) {
+    s_weather_temp_c10 = (int16_t)t_w_temp->value->int32;
+    persist_write_int(PERSIST_WEATHER_TEMP_C10, s_weather_temp_c10);
+    s_have_weather = true;
+    changed = true;
+  }
+  if (t_w_code) {
+    s_weather_code = (uint8_t)t_w_code->value->uint8;
+    persist_write_int(PERSIST_WEATHER_CODE, (int)s_weather_code);
+    s_have_weather = true;
+    changed = true;
+  }
+  if (t_w_day) {
+    s_weather_is_day = (t_w_day->value->uint8 != 0);
+    persist_write_int(PERSIST_WEATHER_IS_DAY, s_weather_is_day ? 1 : 0);
+    s_have_weather = true;
+    changed = true;
+  }
+  if (t_w_f) {
+    s_weather_is_f = (t_w_f->value->uint8 != 0);
+    persist_write_int(PERSIST_WEATHER_IS_F, s_weather_is_f ? 1 : 0);
+    s_have_weather = true;
+    changed = true;
+  }
+
+  if (t_w_wind_spd) {
+    s_weather_wind_spd_x10 = (int16_t)t_w_wind_spd->value->int32;
+    persist_write_int(PERSIST_WEATHER_WIND_SPD_X10, s_weather_wind_spd_x10);
+    s_have_weather = true;
+    changed = true;
+  }
+  if (t_w_wind_dir) {
+    s_weather_wind_dir_deg = (int16_t)t_w_wind_dir->value->int32;
+    persist_write_int(PERSIST_WEATHER_WIND_DIR_DEG, s_weather_wind_dir_deg);
+    s_have_weather = true;
+    changed = true;
+  }
+  if (t_w_precip) {
+    s_weather_precip_x10 = (int16_t)t_w_precip->value->int32;
+    persist_write_int(PERSIST_WEATHER_PRECIP_X10, s_weather_precip_x10);
+    s_have_weather = true;
+    changed = true;
+  }
+  if (t_w_uv) {
+    s_weather_uv_x10 = (int16_t)t_w_uv->value->int32;
+    persist_write_int(PERSIST_WEATHER_UV_X10, s_weather_uv_x10);
+    s_have_weather = true;
+    changed = true;
+  }
+  if (t_w_p) {
+    s_weather_pressure_hpa_x10 = (int16_t)t_w_p->value->int32;
+    persist_write_int(PERSIST_WEATHER_PRESSURE_HPA_X10, s_weather_pressure_hpa_x10);
+    s_have_weather = true;
+    changed = true;
+  }
+
   if (changed) {
     s_last_calc_year = s_last_calc_month = s_last_calc_day = -1;
     // Stamp and persist events when phone provides them.
@@ -278,12 +473,139 @@ static void inbox_received(DictionaryIterator *iter, void *context) {
     if (s_canvas_layer) {
       layer_mark_dirty(s_canvas_layer);
     }
+#ifndef PBL_ROUND
+    if (s_corner_layer) {
+      layer_mark_dirty(s_corner_layer);
+    }
+#endif
+    // Kick the 5s UI alternation timer for corner widgets (tide/weather).
+#ifndef PBL_ROUND
+    schedule_ui_timer();
+#endif
     // If phone isn't available or didn't send events, fallback will fill in.
     schedule_fallback_calc_if_needed();
   }
 
   APP_LOG(APP_LOG_LEVEL_INFO, "inbox_received changed=%d", changed ? 1 : 0);
 }
+
+#ifndef PBL_ROUND
+static void schedule_ui_timer(void);
+
+static bool ui_timer_needed(void) {
+  // Run a 5s redraw timer when any corner widget needs sub-minute alternation.
+  // - weather corner cycles every 5s when weather is present
+  // - tide corner cycles every 5s when tide is present
+  // - top-left alternates steps/battery when battery_alert is true
+  // - bottom-right fallback cycles between sun/moon/phase (when tide absent)
+  if (s_have_weather) return true;
+  if (s_have_tide) return true;
+  if (s_battery_alert) return true;
+  if (s_alt_valid) return true;
+  if (s_home.valid && (s_sun_home.valid || s_moon_home.valid || s_have_moon_phase)) return true;
+  return false;
+}
+
+static void ui_timer_cb(void *context) {
+  (void)context;
+  s_ui_timer = NULL;
+  if (ui_timer_needed() && s_corner_layer) {
+    layer_mark_dirty(s_corner_layer);
+  }
+  schedule_ui_timer();
+}
+
+static void schedule_ui_timer(void) {
+  if (s_ui_timer) return;
+  if (!ui_timer_needed()) return;
+  const time_t now = time(NULL);
+  const int sec = (int)(now % 5);
+  const uint32_t ms = (uint32_t)((sec == 0 ? 5 : (5 - sec)) * 1000);
+  s_ui_timer = app_timer_register(ms, ui_timer_cb, NULL);
+}
+#endif
+
+static bool battery_should_alert(void) {
+  BatteryChargeState st = battery_state_service_peek();
+  s_battery_percent = st.charge_percent;
+
+  // If charging / plugged, no recharge warning.
+  if (st.is_plugged) {
+    s_batt_have_rate = false;
+    return false;
+  }
+
+  const time_t now = time(NULL);
+  if (s_batt_last_percent >= 0 && s_batt_last_time > 0 && now > s_batt_last_time) {
+    const int dp = s_batt_last_percent - (int)st.charge_percent;
+    const int32_t dt = (int32_t)(now - s_batt_last_time);
+    if (dp > 0 && dt >= 60) {
+      // milli(%/hour) = dp * 3600 / dt * 1000 = dp * 3600000 / dt
+      const int32_t new_rate = (int32_t)((int64_t)dp * 3600000LL / (int64_t)dt);
+      if (new_rate > 0) {
+        if (!s_batt_have_rate) {
+          s_batt_rate_milli_per_hour = new_rate;
+          s_batt_have_rate = true;
+        } else {
+          // Smooth a bit (EMA-ish)
+          s_batt_rate_milli_per_hour = (s_batt_rate_milli_per_hour * 3 + new_rate) / 4;
+        }
+      }
+    }
+  }
+
+  s_batt_last_percent = (int)st.charge_percent;
+  s_batt_last_time = now;
+
+  // Always alert when very low.
+  if (st.charge_percent <= 10) return true;
+
+  if (s_batt_have_rate && s_batt_rate_milli_per_hour > 0) {
+    // hours_left ~= percent / (rate %/h)
+    const int32_t hours_left_x1000 = (int32_t)((int32_t)st.charge_percent * 1000 / s_batt_rate_milli_per_hour);
+    return hours_left_x1000 <= 8000;
+  }
+
+  // Fallback heuristic if rate is unknown.
+  return st.charge_percent <= 25;
+}
+
+#ifndef PBL_ROUND
+static void schedule_corner_timer(uint32_t ms);
+
+static void corner_timer_cb(void *context) {
+  (void)context;
+  s_corner_timer = NULL;
+
+  const bool alert = battery_should_alert();
+  const bool changed = (alert != s_battery_alert);
+  s_battery_alert = alert;
+
+  if (changed || alert) {
+    if (s_corner_layer) layer_mark_dirty(s_corner_layer);
+  }
+
+  schedule_corner_timer(alert ? 5000 : 60000);
+}
+
+static void schedule_corner_timer(uint32_t ms) {
+  if (s_corner_timer) {
+    app_timer_cancel(s_corner_timer);
+    s_corner_timer = NULL;
+  }
+  s_corner_timer = app_timer_register(ms, corner_timer_cb, NULL);
+}
+
+static void battery_handler(BatteryChargeState state) {
+  (void)state;
+  const bool alert = battery_should_alert();
+  const bool changed = (alert != s_battery_alert);
+  s_battery_alert = alert;
+  if (changed && s_corner_layer) layer_mark_dirty(s_corner_layer);
+  // Re-evaluate quickly after changes.
+  schedule_corner_timer(alert ? 5000 : 1000);
+}
+#endif // !PBL_ROUND
 
 static void tick_handler(struct tm *tick_time, TimeUnits units_changed) {
   (void)units_changed;
@@ -305,6 +627,9 @@ static void down_long_click_handler(ClickRecognizerRef recognizer, void *context
   if (s_canvas_layer) {
     layer_mark_dirty(s_canvas_layer);
   }
+#ifndef PBL_ROUND
+  if (s_corner_layer) layer_mark_dirty(s_corner_layer);
+#endif
 }
 
 static void down_click_handler(ClickRecognizerRef recognizer, void *context) {
@@ -322,18 +647,78 @@ static void canvas_update_proc(Layer *layer, GContext *ctx) {
   const bool have_loc = s_home.valid;
   const bool have_sun = s_sun_home.valid;
   const bool have_moon = s_moon_home.valid;
-  yes_draw_canvas(layer, ctx,
-                  s_debug,
-                  s_use_internet_fallback,
-                  have_loc,
-                  have_sun,
-                  have_moon,
-                  s_have_moon_phase,
-                  s_moon_phase_e6,
-                  active_loc(),
-                  active_sun(),
-                  active_moon());
+  yes_draw_face(layer, ctx,
+                s_debug,
+                s_use_internet_fallback,
+                have_loc,
+                have_sun,
+                have_moon,
+                s_have_tide,
+                s_tide_last_unix,
+                s_tide_next_unix,
+                s_tide_next_is_high,
+                s_tide_level_x10,
+                s_tide_level_is_ft,
+                s_alt_valid,
+                s_alt_m,
+                s_alt_is_ft,
+                s_battery_alert,
+                s_battery_percent,
+                s_have_weather,
+                s_weather_temp_c10,
+                s_weather_code,
+                s_weather_is_day,
+                s_weather_is_f,
+                s_weather_wind_spd_x10,
+                s_weather_wind_dir_deg,
+                s_weather_precip_x10,
+                s_weather_uv_x10,
+                s_weather_pressure_hpa_x10,
+                s_have_moon_phase,
+                s_moon_phase_e6,
+                active_loc(),
+                active_sun(),
+                active_moon());
 }
+
+#ifndef PBL_ROUND
+static void corner_update_proc(Layer *layer, GContext *ctx) {
+  const bool have_loc = s_home.valid;
+  const bool have_sun = s_sun_home.valid;
+  const bool have_moon = s_moon_home.valid;
+  yes_draw_corners(layer, ctx,
+                   s_debug,
+                   have_loc,
+                   have_sun,
+                   have_moon,
+                   s_have_tide,
+                   s_tide_last_unix,
+                   s_tide_next_unix,
+                   s_tide_next_is_high,
+                   s_tide_level_x10,
+                   s_tide_level_is_ft,
+                   s_alt_valid,
+                   s_alt_m,
+                   s_alt_is_ft,
+                   s_battery_alert,
+                   s_battery_percent,
+                   s_have_weather,
+                   s_weather_temp_c10,
+                   s_weather_code,
+                   s_weather_is_day,
+                   s_weather_is_f,
+                   s_weather_wind_spd_x10,
+                   s_weather_wind_dir_deg,
+                   s_weather_precip_x10,
+                   s_weather_uv_x10,
+                   s_weather_pressure_hpa_x10,
+                   s_have_moon_phase,
+                   s_moon_phase_e6,
+                   active_loc(),
+                   active_sun(),
+                   active_moon());
+}
+#endif
 
 static void prv_window_load(Window *window) {
   Layer *window_layer = window_get_root_layer(window);
@@ -342,6 +727,12 @@ static void prv_window_load(Window *window) {
   s_canvas_layer = layer_create(bounds);
   layer_set_update_proc(s_canvas_layer, canvas_update_proc);
   layer_add_child(window_layer, s_canvas_layer);
+
+#ifndef PBL_ROUND
+  s_corner_layer = layer_create(bounds);
+  layer_set_update_proc(s_corner_layer, corner_update_proc);
+  layer_add_child(window_layer, s_corner_layer);
+#endif
   yes_draw_init();
 
   APP_LOG(APP_LOG_LEVEL_INFO, "window_load");
@@ -353,6 +744,10 @@ static void prv_window_load(Window *window) {
 }
 
 static void prv_window_unload(Window *window) {
+#ifndef PBL_ROUND
+  layer_destroy(s_corner_layer);
+  s_corner_layer = NULL;
+#endif
   layer_destroy(s_canvas_layer);
   s_canvas_layer = NULL;
   yes_draw_deinit();
@@ -364,7 +759,17 @@ static void accel_tap_handler(AccelAxisType axis, int32_t direction) {
   if (s_canvas_layer) {
     layer_mark_dirty(s_canvas_layer);
   }
+#ifndef PBL_ROUND
+  if (s_corner_layer) layer_mark_dirty(s_corner_layer);
+#endif
 }
+
+#ifndef PBL_ROUND
+static void bt_handler(bool connected) {
+  (void)connected;
+  if (s_corner_layer) layer_mark_dirty(s_corner_layer);
+}
+#endif
 
 static void prv_init(void) {
   APP_LOG(APP_LOG_LEVEL_INFO, "init");
@@ -386,6 +791,62 @@ static void prv_init(void) {
   clear_events();
   s_have_moon_phase = false;
   s_moon_phase_e6 = 0;
+  s_have_tide = persist_exists(PERSIST_TIDE_HAVE) ? (persist_read_int(PERSIST_TIDE_HAVE) != 0) : false;
+  s_tide_last_unix = persist_exists(PERSIST_TIDE_LAST_UNIX) ? persist_read_int(PERSIST_TIDE_LAST_UNIX) : 0;
+  s_tide_next_unix = persist_exists(PERSIST_TIDE_NEXT_UNIX) ? persist_read_int(PERSIST_TIDE_NEXT_UNIX) : 0;
+  s_tide_next_is_high = persist_exists(PERSIST_TIDE_NEXT_IS_HIGH) ? (persist_read_int(PERSIST_TIDE_NEXT_IS_HIGH) != 0) : false;
+  s_tide_level_x10 = persist_exists(PERSIST_TIDE_LEVEL_X10) ? (int16_t)persist_read_int(PERSIST_TIDE_LEVEL_X10) : 0;
+  s_tide_level_is_ft = persist_exists(PERSIST_TIDE_LEVEL_IS_FT) ? (persist_read_int(PERSIST_TIDE_LEVEL_IS_FT) != 0) : false;
+#ifndef PBL_ROUND
+  s_ui_timer = NULL;
+  schedule_ui_timer();
+#endif
+
+  s_alt_valid = persist_exists(PERSIST_ALT_VALID) ? (persist_read_int(PERSIST_ALT_VALID) != 0) : false;
+  s_alt_m = persist_exists(PERSIST_ALT_M) ? (int32_t)persist_read_int(PERSIST_ALT_M) : 0;
+  s_alt_is_ft = persist_exists(PERSIST_ALT_IS_FT) ? (persist_read_int(PERSIST_ALT_IS_FT) != 0) : false;
+
+  // Battery corner behavior
+  s_batt_last_percent = -1;
+  s_batt_last_time = 0;
+  s_batt_rate_milli_per_hour = 0;
+  s_batt_have_rate = false;
+  s_battery_percent = battery_state_service_peek().charge_percent;
+  s_battery_alert = battery_should_alert();
+  // On round watches we don't render corner complications; avoid extra timers/redraws.
+#ifndef PBL_ROUND
+  battery_state_service_subscribe(battery_handler);
+  schedule_corner_timer(s_battery_alert ? 5000 : 60000);
+  bluetooth_connection_service_subscribe(bt_handler);
+#endif
+
+  s_have_weather = false;
+  s_weather_temp_c10 = 0;
+  s_weather_code = 0;
+  s_weather_is_day = false;
+  s_weather_is_f = false;
+  s_weather_wind_spd_x10 = 0;
+  s_weather_wind_dir_deg = 0;
+  s_weather_precip_x10 = 0;
+  s_weather_uv_x10 = 0;
+  s_weather_pressure_hpa_x10 = 0;
+  if (persist_exists(PERSIST_WEATHER_TEMP_C10) && persist_exists(PERSIST_WEATHER_CODE)) {
+    s_weather_temp_c10 = (int16_t)persist_read_int(PERSIST_WEATHER_TEMP_C10);
+    s_weather_code = (uint8_t)persist_read_int(PERSIST_WEATHER_CODE);
+    s_weather_is_day = persist_exists(PERSIST_WEATHER_IS_DAY) ? (persist_read_int(PERSIST_WEATHER_IS_DAY) != 0) : false;
+    s_weather_is_f = persist_exists(PERSIST_WEATHER_IS_F) ? (persist_read_int(PERSIST_WEATHER_IS_F) != 0) : false;
+    s_weather_wind_spd_x10 = persist_exists(PERSIST_WEATHER_WIND_SPD_X10) ? (int16_t)persist_read_int(PERSIST_WEATHER_WIND_SPD_X10) : 0;
+    s_weather_wind_dir_deg = persist_exists(PERSIST_WEATHER_WIND_DIR_DEG) ? (int16_t)persist_read_int(PERSIST_WEATHER_WIND_DIR_DEG) : 0;
+    s_weather_precip_x10 = persist_exists(PERSIST_WEATHER_PRECIP_X10) ? (int16_t)persist_read_int(PERSIST_WEATHER_PRECIP_X10) : 0;
+    s_weather_uv_x10 = persist_exists(PERSIST_WEATHER_UV_X10) ? (int16_t)persist_read_int(PERSIST_WEATHER_UV_X10) : 0;
+    s_weather_pressure_hpa_x10 = persist_exists(PERSIST_WEATHER_PRESSURE_HPA_X10) ? (int16_t)persist_read_int(PERSIST_WEATHER_PRESSURE_HPA_X10) : 0;
+    s_have_weather = true;
+  }
+
+#ifndef PBL_ROUND
+  // If we boot with cached tide/weather, ensure the 5s UI timer starts.
+  schedule_ui_timer();
+#endif
 
   // Load cached daily events if available for today (per-location local date)
   if (s_home.valid && persist_exists(PERSIST_HOME_YMD)) {
@@ -451,6 +912,20 @@ static void prv_deinit(void) {
     app_timer_cancel(s_startup_timer);
     s_startup_timer = NULL;
   }
+  if (s_corner_timer) {
+    app_timer_cancel(s_corner_timer);
+    s_corner_timer = NULL;
+  }
+#ifndef PBL_ROUND
+  if (s_ui_timer) {
+    app_timer_cancel(s_ui_timer);
+    s_ui_timer = NULL;
+  }
+#endif
+#ifndef PBL_ROUND
+  battery_state_service_unsubscribe();
+  bluetooth_connection_service_unsubscribe();
+#endif
   window_destroy(s_window);
 }
 

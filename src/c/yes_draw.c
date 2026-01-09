@@ -88,10 +88,11 @@ static void fill_radial_wedge(GContext *ctx, GRect bounds, uint16_t inset,
   graphics_context_set_fill_color(ctx, color);
   const uint16_t thickness = (uint16_t)r; // fill from outside all the way to center
 
+  // Fill clockwise from start->end (our angle convention matches Pebble's: 0 at top, increasing clockwise).
+  // Handle wrap across 0° explicitly.
   if (s < e) {
     graphics_fill_radial(ctx, disk_rect, GOvalScaleModeFitCircle, thickness, s, e);
   } else {
-    // Wrap across 0°
     graphics_fill_radial(ctx, disk_rect, GOvalScaleModeFitCircle, thickness, s, TRIG_MAX_ANGLE);
     graphics_fill_radial(ctx, disk_rect, GOvalScaleModeFitCircle, thickness, 0, e);
   }
@@ -307,12 +308,773 @@ static void draw_moon(GContext *ctx, GPoint center, int radius, double phase) {
   graphics_draw_circle(ctx, center, radius);
 }
 
-void yes_draw_canvas(Layer *layer, GContext *ctx,
+#ifndef PBL_ROUND
+static void draw_tide_icon(GContext *ctx, GPoint origin, int16_t w, int16_t h, GColor col) {
+  // Ocean wave glyph: two stacked sine-like waves.
+  if (w < 8) w = 8;
+  if (h < 4) h = 4;
+  graphics_context_set_stroke_color(ctx, col);
+  graphics_context_set_stroke_width(ctx, 1);
+
+  const int16_t amp = (int16_t)((h / 4) > 1 ? (h / 4) : 1);
+  const int16_t y0 = (int16_t)(origin.y + h / 3);
+  const int16_t y1 = (int16_t)(origin.y + (h * 2) / 3);
+
+  // Sample a sine wave across width.
+  const int samples = (w >= 18) ? 12 : 8;
+  for (int wave = 0; wave < 2; wave++) {
+    const int16_t y_base = (wave == 0) ? y0 : y1;
+    GPoint prev = GPoint(origin.x, y_base);
+    for (int i = 1; i <= samples; i++) {
+      const int16_t x = (int16_t)(origin.x + (int32_t)w * i / samples);
+      // One full sine period across the icon width.
+      const int32_t a = (int32_t)((int64_t)TRIG_MAX_ANGLE * i / samples);
+      const int16_t dy = (int16_t)((int32_t)sin_lookup(a) * amp / TRIG_MAX_RATIO);
+      const GPoint cur = GPoint(x, (int16_t)(y_base - dy));
+      graphics_draw_line(ctx, prev, cur);
+      prev = cur;
+    }
+  }
+}
+
+static void draw_tide_clock(GContext *ctx, GRect bounds, int16_t face_r, int16_t corner_pad,
+                            bool have_tide, int32_t tide_last_unix, int32_t tide_next_unix, bool tide_next_is_high,
+                            int16_t tide_level_x10,
+                            bool tide_level_is_ft,
+                            GColor color_base, GColor color_prog, GColor color_text) {
+  if (!have_tide) return;
+  if (tide_last_unix <= 0 || tide_next_unix <= 0) return;
+  if (tide_next_unix <= tide_last_unix) return;
+
+  const time_t now = time(NULL);
+  const int32_t span = (int32_t)(tide_next_unix - tide_last_unix);
+  int32_t t = (int32_t)(now - (time_t)tide_last_unix);
+  if (t < 0) t = 0;
+  if (t > span) t = span;
+
+  const int16_t r_path = scale_px(10, face_r);
+  const uint16_t stroke = (uint16_t)scale_px(2, face_r);
+  const int16_t r_out = (int16_t)(r_path + (int16_t)(stroke / 2));
+  const int16_t content_w = (int16_t)(2 * r_out);
+  const int16_t icon_w = scale_px(12, face_r);
+  const int16_t icon_h = scale_px(8, face_r);
+  const int16_t gap = scale_px(3, face_r);
+  // Fixed layout: [icon][gap][content box of width content_w] anchored to bottom-right.
+  const int16_t right = (int16_t)(bounds.origin.x + bounds.size.w - corner_pad);
+  const int16_t bottom = (int16_t)(bounds.origin.y + bounds.size.h - corner_pad);
+  const int16_t content_x0 = (int16_t)(right - content_w);
+  const int16_t content_y0 = (int16_t)(bottom - content_w);
+  const int16_t icon_x0 = (int16_t)(content_x0 - gap - icon_w);
+  const int16_t icon_y0 = (int16_t)(bottom - icon_h);
+  draw_tide_icon(ctx, GPoint(icon_x0, icon_y0), icon_w, icon_h, color_text);
+
+  const int16_t cx = (int16_t)(content_x0 + r_out);
+  const int16_t cy = (int16_t)(content_y0 + r_out);
+  const GRect rect = GRect(cx - r_path, cy - r_path, (int16_t)(2 * r_path), (int16_t)(2 * r_path));
+
+  // Cycle 3 views every 5 seconds:
+  // 0) progress ring, 1) minutes to next H/L, 2) current level + trend arrow.
+  const int mode = (int)((now / 5) % 3);
+
+  graphics_context_set_text_color(ctx, color_text);
+  const GFont f_small = (MIN(bounds.size.w, bounds.size.h) >= 200)
+    ? fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD)
+    : fonts_get_system_font(FONT_KEY_GOTHIC_09);
+  const char *label = tide_next_is_high ? "H" : "L";
+
+  const bool rising = tide_next_is_high;
+
+  if (mode == 0) {
+    // Ring view: draw base ring + progress + label + trend arrow.
+    graphics_context_set_stroke_width(ctx, stroke);
+    graphics_context_set_stroke_color(ctx, color_base);
+    graphics_draw_arc(ctx, rect, GOvalScaleModeFitCircle, 0, TRIG_MAX_ANGLE);
+
+    // Label at top (small)
+    graphics_draw_text(ctx, label, f_small,
+                       GRect(cx - r_path, (int16_t)(cy - r_path), (int16_t)(2 * r_path), (int16_t)((r_path / 2) + 1)),
+                       GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
+
+    // Progress arc
+    const int32_t end = (int32_t)((int64_t)TRIG_MAX_ANGLE * (int64_t)t / (int64_t)span);
+    if (end > 0) {
+      graphics_context_set_stroke_color(ctx, color_prog);
+      graphics_draw_arc(ctx, rect, GOvalScaleModeFitCircle, 0, end);
+    }
+    // Trend arrow (bottom). Keep it comfortably away from the H/L label above,
+    // but still clear of the ring stroke.
+    int16_t s = (int16_t)(r_path / 3);
+    if (s < 3) s = 3;
+    const int16_t ay = (int16_t)(cy + r_path - s - 3);
+    const GPoint top = GPoint(cx, (int16_t)(ay - s));
+    const GPoint bot = GPoint(cx, (int16_t)(ay + s));
+    const GPoint left = GPoint((int16_t)(cx - s), ay);
+    const GPoint right = GPoint((int16_t)(cx + s), ay);
+    graphics_context_set_stroke_color(ctx, color_text);
+    graphics_context_set_stroke_width(ctx, 1);
+    if (rising) {
+      graphics_draw_line(ctx, top, left);
+      graphics_draw_line(ctx, top, right);
+    } else {
+      graphics_draw_line(ctx, bot, left);
+      graphics_draw_line(ctx, bot, right);
+    }
+    return;
+  }
+
+  // Text-only views (no circle): show a tide icon at left and text at right, bottom-aligned.
+  char buf[12];
+  buf[0] = '\0';
+
+  if (mode == 1) {
+    // Option A: minutes to next extreme (include H/L for context).
+    int32_t mins = (int32_t)((tide_next_unix - (int32_t)now + 30) / 60);
+    if (mins < 0) mins = 0;
+    if (mins > 999) mins = 999;
+    const int32_t hh = mins / 60;
+    const int32_t mm = mins % 60;
+    // Two-line layout: label above time.
+    char time_buf[8];
+    snprintf(time_buf, sizeof(time_buf), "%ld:%02ld", (long)hh, (long)mm);
+
+    const GFont f_lbl = (MIN(bounds.size.w, bounds.size.h) >= 200)
+      ? fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD)
+      : fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD);
+    const GFont f_time = (MIN(bounds.size.w, bounds.size.h) >= 200)
+      ? fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD)
+      : fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD);
+
+    const int16_t block_w = (int16_t)(right - content_x0);
+    const int16_t lbl_h = scale_px(12, face_r);
+    const int16_t time_h = scale_px(14, face_r);
+    const int16_t top_y = (int16_t)(bottom - (lbl_h + time_h));
+    graphics_draw_text(ctx, label, f_lbl,
+                       GRect(content_x0, top_y, block_w, lbl_h),
+                       GTextOverflowModeTrailingEllipsis, GTextAlignmentRight, NULL);
+    graphics_draw_text(ctx, time_buf, f_time,
+                       GRect(content_x0, (int16_t)(top_y + lbl_h - scale_px(1, face_r)), block_w, time_h),
+                       GTextOverflowModeTrailingEllipsis, GTextAlignmentRight, NULL);
+    return;
+  }
+
+  // mode == 2: level view (two-line, with same "L/H" semantics as countdown)
+  {
+    int v = (int)tide_level_x10;
+    const bool neg = (v < 0);
+    if (v < 0) v = -v;
+    const int ip = v / 10;
+    const int fp = v % 10;
+    const char *unit = tide_level_is_ft ? "ft" : "m";
+    snprintf(buf, sizeof(buf), neg ? "-%d.%d%s" : "%d.%d%s", ip, fp, unit);
+
+    const int16_t block_w = (int16_t)(right - content_x0);
+
+    const GFont f_lbl = (MIN(bounds.size.w, bounds.size.h) >= 200)
+      ? fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD)
+      : fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD);
+    const GFont f_val = (MIN(bounds.size.w, bounds.size.h) >= 200)
+      ? fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD)
+      : fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD);
+
+    // Bottom-align the value using actual rendered height (matches weather temp style).
+    const GSize val_sz = graphics_text_layout_get_content_size(
+      buf, f_val, GRect(0, 0, block_w, scale_px(24, face_r)),
+      GTextOverflowModeTrailingEllipsis, GTextAlignmentRight
+    );
+    const int16_t val_h = (int16_t)val_sz.h;
+    const int16_t val_y = (int16_t)(bottom - val_h);
+
+    const GSize lbl_sz = graphics_text_layout_get_content_size(
+      label, f_lbl, GRect(0, 0, block_w, scale_px(24, face_r)),
+      GTextOverflowModeTrailingEllipsis, GTextAlignmentRight
+    );
+    const int16_t lbl_h = (int16_t)lbl_sz.h;
+    const int16_t lbl_y = (int16_t)(val_y - lbl_h + scale_px(1, face_r));
+
+    // Trend arrow (triangle) in the label line (left), and L/H on the right.
+    int16_t s = (int16_t)(r_path / 4);
+    if (s < 3) s = 3;
+    const int16_t ax = (int16_t)(content_x0 + s + 1);
+    const int16_t ay = (int16_t)(lbl_y + lbl_h / 2);
+    const GPoint atop = GPoint(ax, (int16_t)(ay - s));
+    const GPoint abot = GPoint(ax, (int16_t)(ay + s));
+    const GPoint aleft = GPoint((int16_t)(ax - s), ay);
+    const GPoint aright = GPoint((int16_t)(ax + s), ay);
+    graphics_context_set_stroke_color(ctx, color_text);
+    graphics_context_set_stroke_width(ctx, 1);
+    if (rising) {
+      graphics_draw_line(ctx, atop, aleft);
+      graphics_draw_line(ctx, atop, aright);
+    } else {
+      graphics_draw_line(ctx, abot, aleft);
+      graphics_draw_line(ctx, abot, aright);
+    }
+
+    graphics_draw_text(ctx, label, f_lbl,
+                       GRect(content_x0, lbl_y, block_w, lbl_h),
+                       GTextOverflowModeTrailingEllipsis, GTextAlignmentRight, NULL);
+    graphics_draw_text(ctx, buf, f_val,
+                       GRect(content_x0, val_y, block_w, val_h),
+                       GTextOverflowModeTrailingEllipsis, GTextAlignmentRight, NULL);
+    return;
+  }
+}
+
+static void draw_steps_icon(GContext *ctx, GPoint center, int16_t s, GColor col) {
+  // Two literal footprints: heel + sole + toes.
+  // This reads better than abstract shapes at tiny sizes.
+  if (s < 12) s = 12;
+  graphics_context_set_fill_color(ctx, col);
+
+  const int16_t heel_r = (int16_t)((s / 6) > 1 ? (s / 6) : 1);
+  const int16_t toe_r = (int16_t)((s / 10) > 1 ? (s / 10) : 1);
+  const int16_t sole_w = (int16_t)(s * 2 / 5);
+  const int16_t sole_h = (int16_t)(s * 3 / 5);
+  const uint16_t cr = (uint16_t)((sole_w / 2) > 1 ? (sole_w / 2) : 1);
+
+  // Helper: draw one footprint
+  const int16_t dx = (int16_t)(s / 5);
+  const int16_t dy = (int16_t)(s / 8);
+
+  for (int i = 0; i < 2; i++) {
+    const int16_t sx = (i == 0) ? (int16_t)(-dx) : dx;
+    const int16_t sy = (i == 0) ? dy : (int16_t)(-dy);
+    const GPoint c0 = GPoint((int16_t)(center.x + sx), (int16_t)(center.y + sy));
+
+    // Heel
+    const GPoint heel = GPoint(c0.x, (int16_t)(c0.y + sole_h / 2 - heel_r));
+    graphics_fill_circle(ctx, heel, (uint16_t)heel_r);
+
+    // Sole (rounded rectangle)
+    const GRect sole = GRect((int16_t)(c0.x - sole_w / 2),
+                             (int16_t)(c0.y - sole_h / 2 + toe_r * 2),
+                             sole_w, sole_h);
+    graphics_fill_rect(ctx, sole, cr, GCornersAll);
+
+    // Toes (3 circles near the top, slightly diagonal)
+    const int16_t ty = (int16_t)(sole.origin.y + toe_r);
+    const int16_t tx = sole.origin.x;
+    graphics_fill_circle(ctx, GPoint((int16_t)(tx + toe_r * 2), ty), (uint16_t)toe_r);
+    graphics_fill_circle(ctx, GPoint((int16_t)(tx + toe_r * 4), (int16_t)(ty + toe_r)), (uint16_t)toe_r);
+    graphics_fill_circle(ctx, GPoint((int16_t)(tx + toe_r * 6), (int16_t)(ty + toe_r * 2)), (uint16_t)toe_r);
+  }
+}
+
+static void draw_weather_icon(GContext *ctx, GPoint c, int16_t s, uint8_t code, bool is_day, GColor col) {
+  (void)is_day;
+  graphics_context_set_stroke_color(ctx, col);
+  graphics_context_set_fill_color(ctx, col);
+  graphics_context_set_stroke_width(ctx, 1);
+
+  // Very small icon set based on WMO weather_code categories.
+  // 0: clear, 1-3: partly cloudy, 45/48: fog, 51-67: drizzle/rain, 71-77: snow, 80-99: showers/thunder.
+  if (code == 0) {
+    graphics_draw_circle(ctx, c, (uint16_t)(s / 3));
+    // Rays
+    for (int i = 0; i < 8; i++) {
+      const int32_t a = (int32_t)(i * (TRIG_MAX_ANGLE / 8));
+      const int16_t r0 = (int16_t)(s / 2);
+      const int16_t r1 = (int16_t)(s / 2 + s / 6);
+      const GPoint p0 = GPoint((int16_t)(c.x + (int32_t)sin_lookup(a) * r0 / TRIG_MAX_RATIO),
+                               (int16_t)(c.y - (int32_t)cos_lookup(a) * r0 / TRIG_MAX_RATIO));
+      const GPoint p1 = GPoint((int16_t)(c.x + (int32_t)sin_lookup(a) * r1 / TRIG_MAX_RATIO),
+                               (int16_t)(c.y - (int32_t)cos_lookup(a) * r1 / TRIG_MAX_RATIO));
+      graphics_draw_line(ctx, p0, p1);
+    }
+    return;
+  }
+
+  // Cloud base
+  const int16_t w = s;
+  const int16_t h = (int16_t)(s * 2 / 3);
+  const GRect r = GRect(c.x - w / 2, c.y - h / 2, w, h);
+  graphics_draw_round_rect(ctx, r, (uint16_t)(h / 2));
+
+  if (code <= 3) return; // partly cloudy: just cloud outline
+
+  if (code == 45 || code == 48) {
+    // Fog: 2 lines
+    graphics_draw_line(ctx, GPoint(r.origin.x, (int16_t)(r.origin.y + h + 1)),
+                       GPoint((int16_t)(r.origin.x + w), (int16_t)(r.origin.y + h + 1)));
+    graphics_draw_line(ctx, GPoint(r.origin.x, (int16_t)(r.origin.y + h + 4)),
+                       GPoint((int16_t)(r.origin.x + w), (int16_t)(r.origin.y + h + 4)));
+    return;
+  }
+
+  // Rain / showers / thunder: draw 2-3 drops as short slanted lines.
+  const int16_t y0 = (int16_t)(r.origin.y + h + 1);
+  graphics_draw_line(ctx, GPoint((int16_t)(c.x - s / 4), y0), GPoint((int16_t)(c.x - s / 6), (int16_t)(y0 + s / 4)));
+  graphics_draw_line(ctx, GPoint(c.x, y0), GPoint((int16_t)(c.x + s / 12), (int16_t)(y0 + s / 4)));
+  graphics_draw_line(ctx, GPoint((int16_t)(c.x + s / 4), y0), GPoint((int16_t)(c.x + s / 3), (int16_t)(y0 + s / 4)));
+}
+
+static int16_t weather_icon_extra_bottom(uint8_t code, int16_t s) {
+  // Our drawn weather icon can extend below its nominal (s/2) bounding box due to rain/fog lines.
+  if (code == 0) return 0;
+  if (code <= 3) return 0;
+  if (code == 45 || code == 48) {
+    const int16_t extra = (int16_t)(4 - (s / 6));
+    return (extra > 0) ? extra : 0;
+  }
+  return (int16_t)((s / 12) + 1);
+}
+#endif // !PBL_ROUND
+
+#ifndef PBL_ROUND
+typedef struct {
+  GContext *ctx;
+  GRect bounds;
+  int16_t face_r;
+  int16_t corner_pad;
+  GColor color_txt;
+  GColor color_base;
+  GColor color_prog;
+
+  // Shared state needed by corner complications
+  bool have_tide;
+  int32_t tide_last_unix;
+  int32_t tide_next_unix;
+  bool tide_next_is_high;
+  int16_t tide_level_x10;
+  bool tide_level_is_ft;
+
+  bool alt_valid;
+  int32_t alt_m;
+  bool alt_is_ft;
+
+  bool have_weather;
+  int16_t weather_temp_c10;
+  uint8_t weather_code;
+  bool weather_is_day;
+  bool weather_is_f;
+  int16_t weather_wind_spd_x10;
+  int16_t weather_wind_dir_deg;
+  int16_t weather_precip_x10;
+  int16_t weather_uv_x10;
+  int16_t weather_pressure_hpa_x10;
+
+  bool battery_alert;
+  uint8_t battery_percent;
+
+  bool have_phase;
+  int32_t moon_phase_e6;
+
+  const GeoLoc *loc;
+  const SunTimes *sun_times;
+  const MoonTimes *moon_times;
+
+  int min_dim;
+} CornerCtx;
+
+typedef bool (*CornerAvailFn)(const CornerCtx *c);
+typedef void (*CornerDrawFn)(const CornerCtx *c);
+
+// Generic "slot" helper: if any exclusive comp is available, show the first such comp.
+// Otherwise, cycle through all available comps every 5 seconds.
+typedef struct {
+  CornerAvailFn avail;
+  CornerDrawFn draw;
+  bool exclusive;
+} SlotComp;
+
+static int slot_pick_index(const SlotComp *comps, int count, const CornerCtx *c, time_t now) {
+  // Exclusive-first
+  for (int i = 0; i < count; i++) {
+    if (comps[i].exclusive && (!comps[i].avail || comps[i].avail(c))) return i;
+  }
+  // Cycle among available
+  int idxs[12];
+  int n = 0;
+  for (int i = 0; i < count && n < (int)(sizeof(idxs) / sizeof(idxs[0])); i++) {
+    if (!comps[i].avail || comps[i].avail(c)) idxs[n++] = i;
+  }
+  if (n <= 0) return -1;
+  const int k = (int)((now / 5) % (time_t)n);
+  return idxs[k];
+}
+
+// --- Bottom-right complication implementations (tide absent) ---
+static bool br_avail_alt(const CornerCtx *c) { return c->alt_valid; }
+static bool br_avail_sun(const CornerCtx *c) { return c->sun_times && c->sun_times->valid; }
+static bool br_avail_moon(const CornerCtx *c) { return c->moon_times && c->moon_times->valid; }
+static bool br_avail_age(const CornerCtx *c) { return c->have_phase; }
+
+static int br_compute_now_min(const CornerCtx *c) {
+  int now_min = -1;
+  if (c->loc && c->loc->valid) {
+    time_t now_utc = time(NULL);
+    time_t shifted = now_utc + (time_t)c->loc->tz_offset_min * 60;
+    struct tm *tm_p = gmtime(&shifted);
+    if (tm_p) now_min = tm_p->tm_hour * 60 + tm_p->tm_min;
+  }
+  if (now_min < 0) {
+    time_t now = time(NULL);
+    struct tm *tm_p = localtime(&now);
+    if (tm_p) now_min = tm_p->tm_hour * 60 + tm_p->tm_min;
+  }
+  return now_min;
+}
+
+static void br_draw_alt(const CornerCtx *c) {
+  const int16_t pad = c->corner_pad;
+  const int16_t right = (int16_t)(c->bounds.origin.x + c->bounds.size.w - pad);
+  const int16_t bottom = (int16_t)(c->bounds.origin.y + c->bounds.size.h - pad);
+  const int16_t icon_w = scale_px(12, c->face_r);
+  const int16_t icon_h = scale_px(10, c->face_r);
+  const int16_t gap = scale_px(3, c->face_r);
+  const int16_t icon_x0 = (int16_t)(right - icon_w - gap - scale_px(36, c->face_r));
+  const int16_t icon_y0 = (int16_t)(bottom - icon_h);
+  graphics_context_set_stroke_color(c->ctx, c->color_txt);
+  graphics_context_set_stroke_width(c->ctx, 1);
+  const GPoint a = GPoint(icon_x0, (int16_t)(icon_y0 + icon_h));
+  const GPoint b = GPoint((int16_t)(icon_x0 + icon_w / 2), icon_y0);
+  const GPoint c2 = GPoint((int16_t)(icon_x0 + icon_w), (int16_t)(icon_y0 + icon_h));
+  graphics_draw_line(c->ctx, a, b);
+  graphics_draw_line(c->ctx, b, c2);
+  const GPoint a2 = GPoint((int16_t)(icon_x0 + icon_w / 3), (int16_t)(icon_y0 + icon_h));
+  const GPoint b2 = GPoint((int16_t)(icon_x0 + (icon_w * 2) / 3), (int16_t)(icon_y0 + icon_h / 3));
+  const GPoint c3 = GPoint((int16_t)(icon_x0 + icon_w), (int16_t)(icon_y0 + icon_h));
+  graphics_draw_line(c->ctx, a2, b2);
+  graphics_draw_line(c->ctx, b2, c3);
+
+  const GFont f = (c->min_dim >= 200) ? fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD)
+                                      : fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD);
+  int32_t v = c->alt_m;
+  const bool neg = (v < 0);
+  if (v < 0) v = -v;
+  int32_t disp = v;
+  const char *unit = "m";
+  if (c->alt_is_ft) {
+    disp = (int32_t)((v * 3281 + 500) / 1000);
+    unit = "ft";
+  }
+  char abuf[16];
+  snprintf(abuf, sizeof(abuf), "%s%ld%s", (neg ? "-" : ""), (long)disp, unit);
+
+  const int16_t text_x = (int16_t)(icon_x0 + icon_w + gap);
+  const int16_t text_w = (int16_t)(right - text_x);
+  const GSize tsz = graphics_text_layout_get_content_size(
+    abuf, f, GRect(0, 0, text_w, scale_px(24, c->face_r)),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentRight
+  );
+  const int16_t th = (int16_t)tsz.h;
+  const int16_t ty = (int16_t)(bottom - th);
+  graphics_context_set_text_color(c->ctx, c->color_txt);
+  graphics_draw_text(c->ctx, abuf, f,
+                     GRect(text_x, ty, text_w, th),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentRight, NULL);
+}
+
+static void br_draw_sun_cd(const CornerCtx *c) {
+  const int now_min = br_compute_now_min(c);
+  const int16_t pad = c->corner_pad;
+  const int16_t right = (int16_t)(c->bounds.origin.x + c->bounds.size.w - pad);
+  const int16_t bottom = (int16_t)(c->bounds.origin.y + c->bounds.size.h - pad);
+  const int16_t w = (int16_t)(c->bounds.size.w / 2);
+  const int16_t x0 = (int16_t)(right - w);
+  const GFont f = (c->min_dim >= 200) ? fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD)
+                                      : fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD);
+  char buf[24];
+  buf[0] = '\0';
+
+  if (c->sun_times->always_day) {
+    snprintf(buf, sizeof(buf), "SUN DAY");
+  } else if (c->sun_times->always_night) {
+    snprintf(buf, sizeof(buf), "SUN NITE");
+  } else if (now_min >= 0) {
+    const int sr = c->sun_times->sunrise_min;
+    const int ss = c->sun_times->sunset_min;
+    const bool to_sunrise = (now_min < sr) || (now_min >= ss);
+    int dmin = 0;
+    const char *lab = "SR";
+    if (to_sunrise) {
+      lab = "SR";
+      if (now_min < sr) dmin = sr - now_min;
+      else dmin = (1440 - now_min) + sr;
+    } else {
+      lab = "SS";
+      dmin = ss - now_min;
+    }
+    if (dmin < 0) dmin = 0;
+    const int hh = dmin / 60;
+    const int mm = dmin % 60;
+    snprintf(buf, sizeof(buf), "%s in %d:%02d", lab, hh, mm);
+  }
+
+  const GSize tsz = graphics_text_layout_get_content_size(
+    buf, f, GRect(0, 0, w, scale_px(24, c->face_r)),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentRight
+  );
+  const int16_t th = (int16_t)tsz.h;
+  const int16_t ty = (int16_t)(bottom - th);
+  graphics_context_set_text_color(c->ctx, c->color_txt);
+  graphics_draw_text(c->ctx, buf, f,
+                     GRect(x0, ty, w, th),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentRight, NULL);
+}
+
+static void br_draw_moon_cd(const CornerCtx *c) {
+  const int now_min = br_compute_now_min(c);
+  const int16_t pad = c->corner_pad;
+  const int16_t right = (int16_t)(c->bounds.origin.x + c->bounds.size.w - pad);
+  const int16_t bottom = (int16_t)(c->bounds.origin.y + c->bounds.size.h - pad);
+  const int16_t w = (int16_t)(c->bounds.size.w / 2);
+  const int16_t x0 = (int16_t)(right - w);
+  const GFont f = (c->min_dim >= 200) ? fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD)
+                                      : fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD);
+  char buf[24];
+  buf[0] = '\0';
+
+  if (c->moon_times->always_up) {
+    snprintf(buf, sizeof(buf), "MOON UP");
+  } else if (c->moon_times->always_down) {
+    snprintf(buf, sizeof(buf), "MOON DN");
+  } else if (now_min >= 0) {
+    const int mr = c->moon_times->moonrise_min;
+    const int ms = c->moon_times->moonset_min;
+    int d_mr = (mr >= now_min) ? (mr - now_min) : ((1440 - now_min) + mr);
+    int d_ms = (ms >= now_min) ? (ms - now_min) : ((1440 - now_min) + ms);
+    const bool next_is_mr = (d_mr <= d_ms);
+    const int dmin = next_is_mr ? d_mr : d_ms;
+    const int hh = dmin / 60;
+    const int mm = dmin % 60;
+    snprintf(buf, sizeof(buf), "%s in %d:%02d", next_is_mr ? "MR" : "MS", hh, mm);
+  }
+
+  const GSize tsz = graphics_text_layout_get_content_size(
+    buf, f, GRect(0, 0, w, scale_px(24, c->face_r)),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentRight
+  );
+  const int16_t th = (int16_t)tsz.h;
+  const int16_t ty = (int16_t)(bottom - th);
+  graphics_context_set_text_color(c->ctx, c->color_txt);
+  graphics_draw_text(c->ctx, buf, f,
+                     GRect(x0, ty, w, th),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentRight, NULL);
+}
+
+static void br_draw_moon_age(const CornerCtx *c) {
+  const int16_t pad = c->corner_pad;
+  const int16_t right = (int16_t)(c->bounds.origin.x + c->bounds.size.w - pad);
+  const int16_t bottom = (int16_t)(c->bounds.origin.y + c->bounds.size.h - pad);
+  const int16_t w = (int16_t)(c->bounds.size.w / 2);
+  const int16_t x0 = (int16_t)(right - w);
+  const GFont f = (c->min_dim >= 200) ? fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD)
+                                      : fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD);
+  const int32_t days_x10000 = (int32_t)(((int64_t)c->moon_phase_e6 * 295306LL + 500000LL) / 1000000LL);
+  const int32_t days_x10 = (days_x10000 + 500) / 1000;
+  const int d = (int)(days_x10 / 10);
+  const int frac = (int)(days_x10 % 10);
+  char buf[24];
+  snprintf(buf, sizeof(buf), "Age %d.%dd", d, frac);
+
+  const GSize tsz = graphics_text_layout_get_content_size(
+    buf, f, GRect(0, 0, w, scale_px(24, c->face_r)),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentRight
+  );
+  const int16_t th = (int16_t)tsz.h;
+  const int16_t ty = (int16_t)(bottom - th);
+  graphics_context_set_text_color(c->ctx, c->color_txt);
+  graphics_draw_text(c->ctx, buf, f,
+                     GRect(x0, ty, w, th),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentRight, NULL);
+}
+
+static bool br_avail_tide(const CornerCtx *c) { return c->have_tide; }
+static void br_draw_tide(const CornerCtx *c) {
+  draw_tide_clock(c->ctx, c->bounds, c->face_r, c->corner_pad,
+                  c->have_tide, c->tide_last_unix, c->tide_next_unix, c->tide_next_is_high,
+                  c->tide_level_x10, c->tide_level_is_ft,
+                  c->color_base, c->color_prog, c->color_txt);
+}
+
+static bool tl_avail_bt(const CornerCtx *c) { (void)c; return !bluetooth_connection_service_peek(); }
+static void tl_draw_bt(const CornerCtx *c) {
+  const int16_t pad = c->corner_pad;
+  const int16_t h = (c->min_dim >= 200) ? scale_px(24, c->face_r) : scale_px(20, c->face_r);
+  const GFont f = (c->min_dim >= 200) ? fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD)
+                                      : fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD);
+  graphics_context_set_text_color(c->ctx, c->color_txt);
+  graphics_draw_text(c->ctx, "BT", f,
+                     GRect(pad, pad, c->bounds.size.w / 2, h),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+}
+
+static bool tl_avail_batt(const CornerCtx *c) { return bluetooth_connection_service_peek() && c->battery_alert; }
+static bool tl_avail_steps(const CornerCtx *c) { return bluetooth_connection_service_peek(); }
+
+static void tl_draw_batt(const CornerCtx *c) {
+  const int16_t pad = c->corner_pad;
+  const int16_t h = (c->min_dim >= 200) ? scale_px(24, c->face_r) : scale_px(20, c->face_r);
+  const GFont f = (c->min_dim >= 200) ? fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD)
+                                      : fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD);
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%d%%", (int)c->battery_percent);
+  graphics_context_set_text_color(c->ctx, c->color_txt);
+  graphics_draw_text(c->ctx, buf, f,
+                     GRect((int16_t)(pad + scale_px(18, c->face_r)), pad, c->bounds.size.w / 2, h),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+}
+
+static void tl_draw_steps(const CornerCtx *c) {
+  const int16_t pad = c->corner_pad;
+  const int16_t h = (c->min_dim >= 200) ? scale_px(24, c->face_r) : scale_px(20, c->face_r);
+  const GFont f = (c->min_dim >= 200) ? fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD)
+                                      : fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD);
+  // Health calls can be surprisingly expensive on some platforms; cache at most once per minute.
+  static int s_steps_cached = -1;
+  static time_t s_steps_cached_at = 0;
+  const time_t now = time(NULL);
+  if (s_steps_cached_at == 0 || (now - s_steps_cached_at) >= 60) {
+    int steps = -1;
+    const time_t t0 = time_start_of_today();
+    const HealthServiceAccessibilityMask m = health_service_metric_accessible(HealthMetricStepCount, t0, now);
+    if ((m & HealthServiceAccessibilityMaskAvailable) != 0) {
+      steps = (int)health_service_sum_today(HealthMetricStepCount);
+    }
+    s_steps_cached = steps;
+    s_steps_cached_at = now;
+  }
+  const int steps = s_steps_cached;
+  char buf[16];
+  if (steps < 0) {
+    strcpy(buf, "--");
+  } else if (steps >= 10000) {
+    snprintf(buf, sizeof(buf), "%dk", steps / 1000);
+  } else {
+    snprintf(buf, sizeof(buf), "%d", steps);
+  }
+  graphics_context_set_text_color(c->ctx, c->color_txt);
+  const int16_t icon_s = scale_px(14, c->face_r);
+  draw_steps_icon(c->ctx, GPoint((int16_t)(pad + icon_s / 2), (int16_t)(pad + h / 2)), icon_s, c->color_txt);
+  graphics_draw_text(c->ctx, buf, f,
+                     GRect((int16_t)(pad + scale_px(18, c->face_r)), pad, c->bounds.size.w / 2, h),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+}
+
+// --- Weather slot (bottom-left) ---
+static bool wx_avail_temp(const CornerCtx *c) { return c->have_weather; }
+static bool wx_avail_wind(const CornerCtx *c) { return c->have_weather && c->weather_wind_spd_x10 != 0; }
+static bool wx_avail_precip(const CornerCtx *c) { return c->have_weather && c->weather_precip_x10 != 0; }
+static bool wx_avail_uv(const CornerCtx *c) { return c->have_weather && c->weather_uv_x10 > 0; }
+static bool wx_avail_p(const CornerCtx *c) { return c->have_weather && c->weather_pressure_hpa_x10 != 0; }
+
+static void wx_draw_common(const CornerCtx *c, const char *text, GFont f_use) {
+  const int16_t pad = c->corner_pad;
+  const int16_t icon_s = scale_px(16, c->face_r);
+  const int16_t icon_bottom = (int16_t)(c->bounds.size.h - c->corner_pad);
+  const int16_t extra = weather_icon_extra_bottom(c->weather_code, icon_s);
+  const int16_t cy = (int16_t)(icon_bottom - (icon_s / 2) - extra);
+  const GPoint ic = GPoint((int16_t)(pad + icon_s / 2), cy);
+  draw_weather_icon(c->ctx, ic, icon_s, c->weather_code, c->weather_is_day, c->color_txt);
+
+  const int16_t h = (c->min_dim >= 200) ? scale_px(24, c->face_r) : scale_px(20, c->face_r);
+  const int16_t text_x = (int16_t)(pad + icon_s + scale_px(4, c->face_r));
+  const int16_t text_w = (int16_t)(c->bounds.size.w / 2);
+  const GSize text_sz = graphics_text_layout_get_content_size(
+    text, f_use, GRect(0, 0, text_w, h),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft
+  );
+  int16_t text_h = (int16_t)text_sz.h;
+  if (text_h < 1) text_h = h;
+  int16_t text_top = (int16_t)(icon_bottom - text_h);
+  if (text_top < 0) text_top = 0;
+  if (text_top > (int16_t)(c->bounds.size.h - text_h)) text_top = (int16_t)(c->bounds.size.h - text_h);
+
+  graphics_context_set_text_color(c->ctx, c->color_txt);
+  graphics_draw_text(c->ctx, text, f_use,
+                     GRect(text_x, text_top, text_w, text_h),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+}
+
+static void wx_draw_temp(const CornerCtx *c) {
+  const GFont f = (c->min_dim >= 200) ? fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD)
+                                      : fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD);
+  int t_disp = (int)c->weather_temp_c10;
+  if (c->weather_is_f) {
+    const int32_t num = (int32_t)t_disp * 9;
+    const int32_t div = (num >= 0) ? ((num + 2) / 5) : ((num - 2) / 5);
+    t_disp = (int)(div + 320);
+  }
+  const int t_abs = t_disp < 0 ? -t_disp : t_disp;
+  const int t_int = t_abs / 10;
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%s%d\u00B0", (t_disp < 0 ? "-" : ""), t_int);
+  wx_draw_common(c, buf, f);
+}
+
+static void wx_draw_wind(const CornerCtx *c) {
+  const GFont f = (c->min_dim >= 200) ? fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD)
+                                      : fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD);
+  const int spd_x10 = (int)c->weather_wind_spd_x10;
+  const int spd_abs = (spd_x10 < 0) ? -spd_x10 : spd_x10;
+  const int spd_int = (spd_abs + 5) / 10;
+  const int dir = (int)c->weather_wind_dir_deg;
+  const int idx = (int)(((dir % 360) + 22) / 45) & 7;
+  const char *card[8] = { "N", "NE", "E", "SE", "S", "SW", "W", "NW" };
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%s %d%s", card[idx], spd_int, c->weather_is_f ? "mph" : "m/s");
+  wx_draw_common(c, buf, f);
+}
+
+static void wx_draw_precip(const CornerCtx *c) {
+  const GFont f = (c->min_dim >= 200) ? fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD)
+                                      : fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD);
+  const int pr_x10 = (int)c->weather_precip_x10;
+  const int pr_abs = (pr_x10 < 0) ? -pr_x10 : pr_x10;
+  const int pr_int = pr_abs / 10;
+  const int pr_frac = pr_abs % 10;
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%s%d.%d%s", (pr_x10 < 0 ? "-" : ""), pr_int, pr_frac, c->weather_is_f ? "in" : "mm");
+  wx_draw_common(c, buf, f);
+}
+
+static void wx_draw_uv(const CornerCtx *c) {
+  const GFont f_small = (c->min_dim >= 200) ? fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD)
+                                            : fonts_get_system_font(FONT_KEY_GOTHIC_09);
+  const int uv_i = ((int)c->weather_uv_x10 + 5) / 10;
+  char buf[16];
+  snprintf(buf, sizeof(buf), "UV %d", uv_i);
+  wx_draw_common(c, buf, f_small);
+}
+
+static void wx_draw_pressure(const CornerCtx *c) {
+  const GFont f = (c->min_dim >= 200) ? fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD)
+                                      : fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD);
+  const int p_i = ((int)c->weather_pressure_hpa_x10 + 5) / 10;
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%dhPa", p_i);
+  wx_draw_common(c, buf, f);
+}
+#endif
+
+void yes_draw_face(Layer *layer, GContext *ctx,
                      bool debug,
                      bool net_on,
                      bool have_loc,
                      bool have_sun,
                      bool have_moon,
+                     bool have_tide,
+                     int32_t tide_last_unix,
+                     int32_t tide_next_unix,
+                     bool tide_next_is_high,
+                     int16_t tide_level_x10,
+                     bool tide_level_is_ft,
+                     bool alt_valid,
+                     int32_t alt_m,
+                     bool alt_is_ft,
+                     bool battery_alert,
+                     uint8_t battery_percent,
+                     bool have_weather,
+                     int16_t weather_temp_c10,
+                     uint8_t weather_code,
+                     bool weather_is_day,
+                     bool weather_is_f,
+                     int16_t weather_wind_spd_x10,
+                     int16_t weather_wind_dir_deg,
+                     int16_t weather_precip_x10,
+                     int16_t weather_uv_x10,
+                     int16_t weather_pressure_hpa_x10,
                      bool have_phase,
                      int32_t moon_phase_e6,
                      const GeoLoc *loc,
@@ -322,12 +1084,16 @@ void yes_draw_canvas(Layer *layer, GContext *ctx,
   const GPoint c = grect_center_point(&bounds);
   const int min_dim = (int)MIN(bounds.size.w, bounds.size.h);
   const int16_t face_r = (int16_t)(min_dim / 2);
+  const int16_t corner_pad = scale_px(6, face_r);
+#ifdef PBL_ROUND
+  (void)corner_pad;
+#endif
 
   graphics_context_set_fill_color(ctx, GColorBlack);
   graphics_fill_rect(ctx, bounds, 0, GCornerNone);
 
   if (debug) {
-    char buf0[32], buf1[32], buf2[32], buf3[32], buf4[32];
+    char buf0[32], buf1[32], buf2[32], buf3[32], buf4[32], buf5[32];
 
     char time_buf[6];
     if (loc && loc->valid) {
@@ -383,33 +1149,77 @@ void yes_draw_canvas(Layer *layer, GContext *ctx,
       snprintf(buf3, sizeof(buf3), "MOON: --");
     }
 
+    if (have_tide && tide_last_unix > 0 && tide_next_unix > tide_last_unix) {
+      const int mins = (int)((tide_next_unix - (int32_t)time(NULL)) / 60);
+      snprintf(buf5, sizeof(buf5), "TIDE next %s in %dm", tide_next_is_high ? "H" : "L", mins);
+    } else {
+      snprintf(buf5, sizeof(buf5), "TIDE: --");
+    }
+
     graphics_context_set_text_color(ctx, GColorWhite);
-    const int16_t line_h = (min_dim >= 200) ? scale_px(24, face_r) : scale_px(22, face_r);
-    const int16_t top_y = scale_px(8, face_r);
     const GFont f_dbg0 = (min_dim >= 200) ? fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD)
                                           : fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD);
     const GFont f_dbg = (min_dim >= 200) ? fonts_get_system_font(FONT_KEY_GOTHIC_24)
                                          : fonts_get_system_font(FONT_KEY_GOTHIC_18);
 
-    graphics_draw_text(ctx, buf0, f_dbg0,
-                       GRect(0, top_y, bounds.size.w, line_h),
-                       GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
-    graphics_draw_text(ctx, buf1, f_dbg,
-                       GRect(0, (int16_t)(top_y + line_h + scale_px(4, face_r)), bounds.size.w, line_h),
-                       GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
-    graphics_draw_text(ctx, buf4, f_dbg,
-                       GRect(0, (int16_t)(top_y + 2 * line_h + scale_px(8, face_r)), bounds.size.w, line_h),
-                       GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
-    graphics_draw_text(ctx, buf2, f_dbg,
-                       GRect(0, (int16_t)(top_y + 3 * line_h + scale_px(12, face_r)), bounds.size.w, line_h),
-                       GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
-    graphics_draw_text(ctx, buf3, f_dbg,
-                       GRect(0, (int16_t)(top_y + 4 * line_h + scale_px(16, face_r)), bounds.size.w, line_h),
-                       GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
-
     const GFont f_hint = (min_dim >= 200) ? fonts_get_system_font(FONT_KEY_GOTHIC_18)
                                           : fonts_get_system_font(FONT_KEY_GOTHIC_14);
     const int16_t hint_h = (min_dim >= 200) ? scale_px(22, face_r) : scale_px(18, face_r);
+
+    // Layout: stack lines using actual font heights with minimal gaps so everything fits above the hint.
+    const int16_t gap = scale_px(1, face_r);
+    const int16_t top_y_default = scale_px(6, face_r);
+    const int16_t max_y = (int16_t)(bounds.size.h - hint_h);
+
+    const int16_t h0 = (int16_t)graphics_text_layout_get_content_size(
+      buf0, f_dbg0, GRect(0, 0, bounds.size.w, bounds.size.h),
+      GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter
+    ).h;
+    const int16_t h = (int16_t)graphics_text_layout_get_content_size(
+      "Ag", f_dbg, GRect(0, 0, bounds.size.w, bounds.size.h),
+      GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter
+    ).h;
+
+    // Total height for 6 lines with 5 gaps.
+    int16_t total = (int16_t)(h0 + 5 * h + 5 * gap);
+    int16_t top_y = top_y_default;
+    int16_t use_gap = gap;
+    const int16_t avail = (int16_t)(max_y - top_y_default);
+    if (avail > 0 && total > avail) {
+      // Tighten up if needed.
+      use_gap = 0;
+      top_y = 0;
+      total = (int16_t)(h0 + 5 * h);
+    }
+
+    int16_t y = top_y;
+    graphics_draw_text(ctx, buf0, f_dbg0,
+                       GRect(0, y, bounds.size.w, h0),
+                       GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
+    y = (int16_t)(y + h0 + use_gap);
+    graphics_draw_text(ctx, buf1, f_dbg,
+                       GRect(0, y, bounds.size.w, h),
+                       GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
+    y = (int16_t)(y + h + use_gap);
+    graphics_draw_text(ctx, buf4, f_dbg,
+                       GRect(0, y, bounds.size.w, h),
+                       GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
+    y = (int16_t)(y + h + use_gap);
+    graphics_draw_text(ctx, buf2, f_dbg,
+                       GRect(0, y, bounds.size.w, h),
+                       GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
+    y = (int16_t)(y + h + use_gap);
+    graphics_draw_text(ctx, buf3, f_dbg,
+                       GRect(0, y, bounds.size.w, h),
+                       GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
+    y = (int16_t)(y + h + use_gap);
+    // Clamp last line to stay above hint.
+    int16_t y5 = y;
+    if ((int16_t)(y5 + h) > max_y) y5 = (int16_t)(max_y - h);
+    graphics_draw_text(ctx, buf5, f_dbg,
+                       GRect(0, y5, bounds.size.w, h),
+                       GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
+
     graphics_draw_text(ctx, "Tap to exit debug", f_hint,
                        GRect(0, (int16_t)(bounds.size.h - hint_h), bounds.size.w, hint_h),
                        GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
@@ -707,7 +1517,226 @@ void yes_draw_canvas(Layer *layer, GContext *ctx,
     }
   }
 
+  // Corner: top-left is now drawn in the overlay layer (`yes_draw_corners`) so that 5s
+  // alternation doesn't force a full watchface redraw.
+
+  // Corner: top-right date (constant)
+  {
+#ifdef PBL_ROUND
+    // Skip corners on round watches to avoid wasted draw calls.
+#else
+    const int16_t pad = corner_pad;
+    const int16_t h = (min_dim >= 200) ? scale_px(24, face_r) : scale_px(20, face_r);
+    const GFont f = (min_dim >= 200) ? fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD)
+                                     : fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD);
+    const GFont f2 = (min_dim >= 200) ? fonts_get_system_font(FONT_KEY_GOTHIC_14)
+                                      : fonts_get_system_font(FONT_KEY_GOTHIC_09);
+    char date_buf[16];
+    char year_buf[8];
+    date_buf[0] = '\0';
+    year_buf[0] = '\0';
+    if (loc && loc->valid) {
+      time_t now_utc = time(NULL);
+      time_t shifted = now_utc + (time_t)loc->tz_offset_min * 60;
+      struct tm *tm_p = gmtime(&shifted);
+      if (tm_p) {
+        strftime(date_buf, sizeof(date_buf), "%b %e", tm_p);
+        strftime(year_buf, sizeof(year_buf), "%Y", tm_p);
+      }
+    }
+    if (!date_buf[0]) {
+      time_t now = time(NULL);
+      struct tm *tm_p = localtime(&now);
+      if (tm_p) {
+        strftime(date_buf, sizeof(date_buf), "%b %e", tm_p);
+        strftime(year_buf, sizeof(year_buf), "%Y", tm_p);
+      }
+      else strcpy(date_buf, "--");
+    }
+    graphics_context_set_text_color(ctx, GColorWhite);
+    graphics_draw_text(ctx, date_buf, f,
+                       GRect(bounds.size.w / 2, pad, bounds.size.w / 2 - pad, h),
+                       GTextOverflowModeTrailingEllipsis, GTextAlignmentRight, NULL);
+    if (year_buf[0]) {
+      const int16_t yh = (min_dim >= 200) ? scale_px(16, face_r) : scale_px(14, face_r);
+      // Nudge the year up closer to the date so it reads as a single grouped widget.
+      const int16_t y = (int16_t)(pad + h - scale_px(8, face_r));
+      graphics_draw_text(ctx, year_buf, f2,
+                         GRect(bounds.size.w / 2, y, bounds.size.w / 2 - pad, yh),
+                         GTextOverflowModeTrailingEllipsis, GTextAlignmentRight, NULL);
+    }
+#endif
+  }
+
+  // Corner: bottom-left weather is now drawn in the overlay layer (`yes_draw_corners`) so that
+  // 5s alternation doesn't force a full watchface redraw.
+
+  // Bottom-right complications are now drawn in the overlay layer (`yes_draw_corners`) so that
+  // 5s alternation doesn't force a full watchface redraw.
+
   // No placeholder text here; startup loading screen handles missing inputs.
 }
+
+#ifndef PBL_ROUND
+void yes_draw_corners(Layer *layer, GContext *ctx,
+                      bool debug,
+                      bool have_loc,
+                      bool have_sun,
+                      bool have_moon,
+                      bool have_tide,
+                      int32_t tide_last_unix,
+                      int32_t tide_next_unix,
+                      bool tide_next_is_high,
+                      int16_t tide_level_x10,
+                      bool tide_level_is_ft,
+                      bool alt_valid,
+                      int32_t alt_m,
+                      bool alt_is_ft,
+                      bool battery_alert,
+                      uint8_t battery_percent,
+                      bool have_weather,
+                      int16_t weather_temp_c10,
+                      uint8_t weather_code,
+                      bool weather_is_day,
+                      bool weather_is_f,
+                      int16_t weather_wind_spd_x10,
+                      int16_t weather_wind_dir_deg,
+                      int16_t weather_precip_x10,
+                      int16_t weather_uv_x10,
+                      int16_t weather_pressure_hpa_x10,
+                      bool have_phase,
+                      int32_t moon_phase_e6,
+                      const GeoLoc *loc,
+                      const SunTimes *sun_times,
+                      const MoonTimes *moon_times) {
+  (void)layer;
+  // Mirror the old behavior: no corners on debug or loading screen.
+  if (debug) return;
+  if (!(have_loc && have_sun && have_moon)) return;
+
+  const GRect bounds = layer_get_bounds(layer);
+  const int min_dim = (int)MIN(bounds.size.w, bounds.size.h);
+  const int16_t face_r = (int16_t)(min_dim / 2);
+  const int16_t corner_pad = scale_px(6, face_r);
+
+  // Construct a shared context for slot implementations.
+  CornerCtx cc = (CornerCtx){
+    .ctx = ctx,
+    .bounds = bounds,
+    .face_r = face_r,
+    .corner_pad = corner_pad,
+    .color_txt = GColorWhite,
+    .color_base = GColorDarkGray,
+    .color_prog = GColorWhite,
+    .have_tide = have_tide,
+    .tide_last_unix = tide_last_unix,
+    .tide_next_unix = tide_next_unix,
+    .tide_next_is_high = tide_next_is_high,
+    .tide_level_x10 = tide_level_x10,
+    .tide_level_is_ft = tide_level_is_ft,
+    .alt_valid = alt_valid,
+    .alt_m = alt_m,
+    .alt_is_ft = alt_is_ft,
+    .have_weather = have_weather,
+    .weather_temp_c10 = weather_temp_c10,
+    .weather_code = weather_code,
+    .weather_is_day = weather_is_day,
+    .weather_is_f = weather_is_f,
+    .weather_wind_spd_x10 = weather_wind_spd_x10,
+    .weather_wind_dir_deg = weather_wind_dir_deg,
+    .weather_precip_x10 = weather_precip_x10,
+    .weather_uv_x10 = weather_uv_x10,
+    .weather_pressure_hpa_x10 = weather_pressure_hpa_x10,
+    .battery_alert = battery_alert,
+    .battery_percent = battery_percent,
+    .have_phase = have_phase,
+    .moon_phase_e6 = moon_phase_e6,
+    .loc = loc,
+    .sun_times = sun_times,
+    .moon_times = moon_times,
+    .min_dim = min_dim,
+  };
+
+  // Top-left slot
+  {
+    const SlotComp comps[] = {
+      { tl_avail_bt,    tl_draw_bt,    true  },
+      { tl_avail_batt,  tl_draw_batt,  false },
+      { tl_avail_steps, tl_draw_steps, false },
+    };
+    const int which = slot_pick_index(comps, (int)(sizeof(comps) / sizeof(comps[0])), &cc, time(NULL));
+    if (which >= 0) comps[which].draw(&cc);
+  }
+
+  // Top-right date remains in face layer (static); keep corners layer lightweight.
+
+  // Bottom-left weather slot
+  if (have_weather) {
+    const SlotComp comps[] = {
+      { wx_avail_temp,   wx_draw_temp,     false },
+      { wx_avail_wind,   wx_draw_wind,     false },
+      { wx_avail_precip, wx_draw_precip,   false },
+      { wx_avail_uv,     wx_draw_uv,       false },
+      { wx_avail_p,      wx_draw_pressure, false },
+    };
+    const int which = slot_pick_index(comps, (int)(sizeof(comps) / sizeof(comps[0])), &cc, time(NULL));
+    if (which >= 0) comps[which].draw(&cc);
+  }
+
+  // Bottom-right slot
+  {
+    const SlotComp comps[] = {
+      { br_avail_tide, br_draw_tide,     true  },
+      { br_avail_alt,  br_draw_alt,      false },
+      { br_avail_sun,  br_draw_sun_cd,   false },
+      { br_avail_moon, br_draw_moon_cd,  false },
+      { br_avail_age,  br_draw_moon_age, false },
+    };
+    const int which = slot_pick_index(comps, (int)(sizeof(comps) / sizeof(comps[0])), &cc, time(NULL));
+    if (which >= 0) comps[which].draw(&cc);
+  }
+}
+#else
+void yes_draw_corners(Layer *layer, GContext *ctx,
+                      bool debug,
+                      bool have_loc,
+                      bool have_sun,
+                      bool have_moon,
+                      bool have_tide,
+                      int32_t tide_last_unix,
+                      int32_t tide_next_unix,
+                      bool tide_next_is_high,
+                      int16_t tide_level_x10,
+                      bool tide_level_is_ft,
+                      bool alt_valid,
+                      int32_t alt_m,
+                      bool alt_is_ft,
+                      bool battery_alert,
+                      uint8_t battery_percent,
+                      bool have_weather,
+                      int16_t weather_temp_c10,
+                      uint8_t weather_code,
+                      bool weather_is_day,
+                      bool weather_is_f,
+                      int16_t weather_wind_spd_x10,
+                      int16_t weather_wind_dir_deg,
+                      int16_t weather_precip_x10,
+                      int16_t weather_uv_x10,
+                      int16_t weather_pressure_hpa_x10,
+                      bool have_phase,
+                      int32_t moon_phase_e6,
+                      const GeoLoc *loc,
+                      const SunTimes *sun_times,
+                      const MoonTimes *moon_times) {
+  (void)layer; (void)ctx; (void)debug; (void)have_loc; (void)have_sun; (void)have_moon;
+  (void)have_tide; (void)tide_last_unix; (void)tide_next_unix; (void)tide_next_is_high; (void)tide_level_x10; (void)tide_level_is_ft;
+  (void)alt_valid; (void)alt_m; (void)alt_is_ft;
+  (void)battery_alert; (void)battery_percent;
+  (void)have_weather; (void)weather_temp_c10; (void)weather_code; (void)weather_is_day; (void)weather_is_f;
+  (void)weather_wind_spd_x10; (void)weather_wind_dir_deg; (void)weather_precip_x10; (void)weather_uv_x10; (void)weather_pressure_hpa_x10;
+  (void)have_phase; (void)moon_phase_e6;
+  (void)loc; (void)sun_times; (void)moon_times;
+}
+#endif
 
 

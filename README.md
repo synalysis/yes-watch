@@ -40,6 +40,11 @@ pebble install --emulator basalt
 pebble logs --emulator basalt
 ```
 
+## Configure in the emulator
+```
+pebble emu-app-config --emulator emery
+```
+
 You can target other emulators (`diorite`, `flint`, `chalk`, `emery`) the same way.
 
 ## Configuration

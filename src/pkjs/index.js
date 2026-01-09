@@ -25,6 +25,28 @@ const KEYS = {
 
   MOON_PHASE_E6: 'KEY_MOON_PHASE_E6',
 
+  TIDE_HAVE: 'KEY_TIDE_HAVE',
+  TIDE_LAST_UNIX: 'KEY_TIDE_LAST_UNIX',
+  TIDE_NEXT_UNIX: 'KEY_TIDE_NEXT_UNIX',
+  TIDE_NEXT_IS_HIGH: 'KEY_TIDE_NEXT_IS_HIGH',
+  TIDE_LEVEL_X10: 'KEY_TIDE_LEVEL_X10',
+  TIDE_LEVEL_IS_FT: 'KEY_TIDE_LEVEL_IS_FT',
+
+  ALT_VALID: 'KEY_ALT_VALID',
+  ALT_M: 'KEY_ALT_M',
+  ALT_IS_FT: 'KEY_ALT_IS_FT',
+
+  WEATHER_TEMP_C10: 'KEY_WEATHER_TEMP_C10',
+  WEATHER_CODE: 'KEY_WEATHER_CODE',
+  WEATHER_IS_DAY: 'KEY_WEATHER_IS_DAY',
+  WEATHER_IS_F: 'KEY_WEATHER_IS_F',
+
+  WEATHER_WIND_SPD_X10: 'KEY_WEATHER_WIND_SPD_X10',
+  WEATHER_WIND_DIR_DEG: 'KEY_WEATHER_WIND_DIR_DEG',
+  WEATHER_PRECIP_X10: 'KEY_WEATHER_PRECIP_X10',
+  WEATHER_UV_X10: 'KEY_WEATHER_UV_X10',
+  WEATHER_PRESSURE_HPA_X10: 'KEY_WEATHER_PRESSURE_HPA_X10',
+
   USE_INTERNET_FALLBACK: 'KEY_USE_INTERNET_FALLBACK'
 };
 
@@ -38,13 +60,365 @@ function log() {
 // --- AppMessage queue (avoid burst sending that can wedge pypkjs/QEMU) ---
 const State = {
   lastSentAtMs: 0,
+  lastLocRequestAtMs: 0,
   lastLoc: null,      // {latE6, lonE6, tzOffsetMin}
   lastLocSent: null,  // {latE6, lonE6, tzOffsetMin, ymd} persisted
   lastAstroYmd: 0,
 
+  tideStations: null, // [{id, lat, lng}] cached in-memory
+  tideStationsFetchedAtMs: 0,
+  lastTideSentAtMs: 0,
+  lastTideSuccessAtMs: 0,
+  lastTideAttemptAtMs: 0,
+  lastTideLoc: null, // {latE6, lonE6}
+
+  lastWeatherSentAtMs: 0,
+  lastWeatherSuccessAtMs: 0,
+  lastWeatherAttemptAtMs: 0,
+  lastWeatherLoc: null, // {latE6, lonE6}
+
   isSending: false,
   msgQueue: []
 };
+
+const TIDE_NEAR_COAST_THRESHOLD_M = 50000; // 50 km
+const TIDE_STATION_CACHE_MS = 7 * 24 * 60 * 60 * 1000; // refresh weekly
+const TIDE_REFRESH_MS = 60 * 60 * 1000; // refresh predictions hourly
+const TIDE_STATION_FETCH_TIMEOUT_MS = 60000; // large one-time download; cache afterwards
+const TIDE_RETRY_MS = 2 * 60 * 1000; // retry quickly on failure
+
+const WEATHER_REFRESH_MS = 30 * 60 * 1000; // weather doesn't need to be frequent
+const WEATHER_RETRY_MS = 2 * 60 * 1000; // retry quickly on failure
+
+function loadTideStationsFromStorage() {
+  try {
+    const raw = localStorage.getItem('noaaTideStations');
+    const at = parseInt(localStorage.getItem('noaaTideStationsAtMs') || '0', 10);
+    if (!raw || !isFinite(at) || at <= 0) return null;
+    const arr = JSON.parse(raw);
+    if (!arr || !arr.length) return null;
+    State.tideStations = arr;
+    State.tideStationsFetchedAtMs = at;
+    return arr;
+  } catch (e) {
+    return null;
+  }
+}
+
+function saveTideStationsToStorage(stations) {
+  try {
+    localStorage.setItem('noaaTideStations', JSON.stringify(stations));
+    localStorage.setItem('noaaTideStationsAtMs', String(Date.now()));
+  } catch (e) {}
+}
+
+function safeParseUnixFromNoaaGmtTime(t) {
+  // NOAA returns e.g. "2026-01-08 09:24" when time_zone=gmt
+  const s = String(t || '');
+  const m = /^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2})/.exec(s);
+  if (!m) return null;
+  const iso = m[1] + '-' + m[2] + '-' + m[3] + 'T' + m[4] + ':' + m[5] + ':00Z';
+  const ms = Date.parse(iso);
+  if (!isFinite(ms)) return null;
+  return Math.floor(ms / 1000);
+}
+
+function ymdUtcIntFromUnix(unixSec) {
+  const d = new Date(unixSec * 1000);
+  const y = d.getUTCFullYear();
+  const m = d.getUTCMonth() + 1;
+  const dd = d.getUTCDate();
+  return y * 10000 + m * 100 + dd;
+}
+
+function ymdhmUtcFromUnix(unixSec) {
+  const d = new Date(unixSec * 1000);
+  const y = d.getUTCFullYear();
+  const m = d.getUTCMonth() + 1;
+  const dd = d.getUTCDate();
+  const hh = d.getUTCHours();
+  const mm = d.getUTCMinutes();
+  return String(y) + pad2(m) + pad2(dd) + ' ' + pad2(hh) + ':' + pad2(mm);
+}
+
+function parseNoaaLevelMeters(v) {
+  const f = parseFloat(String(v || '').replace(',', '.'));
+  if (!isFinite(f)) return null;
+  return f;
+}
+
+function fetchNoaaLevelX10ForStationGmt(stationId, nowUnix, useImperial) {
+  // Fetch ~±1 hour around now, pick the latest prediction <= now.
+  const now = typeof nowUnix === 'number' ? nowUnix : Math.floor(Date.now() / 1000);
+  const begin = ymdhmUtcFromUnix(now - 3600);
+  const end = ymdhmUtcFromUnix(now + 3600);
+  const url =
+    'https://api.tidesandcurrents.noaa.gov/api/prod/datagetter' +
+    '?product=predictions' +
+    '&application=pebble-yes-watch' +
+    '&begin_date=' + encodeURIComponent(begin) +
+    '&end_date=' + encodeURIComponent(end) +
+    '&datum=MLLW' +
+    '&station=' + encodeURIComponent(String(stationId)) +
+    '&time_zone=gmt' +
+    '&units=metric' +
+    '&interval=6' +
+    '&format=json';
+  return httpGetJson(url).then((json) => {
+    const preds = json && json.predictions ? json.predictions : null;
+    if (!preds || !preds.length) throw new Error('noaa level missing');
+    let best = null;
+    let bestTs = -1;
+    for (let i = 0; i < preds.length; i++) {
+      const p = preds[i];
+      const ts = safeParseUnixFromNoaaGmtTime(p && p.t);
+      if (typeof ts !== 'number') continue;
+      if (ts > now) continue;
+      if (ts >= bestTs) {
+        bestTs = ts;
+        best = p;
+      }
+    }
+    if (!best) best = preds[0];
+    const meters = parseNoaaLevelMeters(best && best.v);
+    if (meters === null) throw new Error('noaa level parse');
+    if (useImperial) {
+      const ft = meters * 3.28084;
+      return Math.round(ft * 10); // ft * 10
+    }
+    return Math.round(meters * 10); // m * 10
+  });
+}
+
+function fetchNoaaTideStations() {
+  // NOTE: NOAA MDAPI doesn't support lat/lon filtering here, so we download once and pick nearest locally.
+  const url = 'https://api.tidesandcurrents.noaa.gov/mdapi/prod/webapi/stations.json?type=tidepredictions';
+  return httpGetJsonTimeout(url, TIDE_STATION_FETCH_TIMEOUT_MS).then((json) => {
+    const arr = json && json.stations ? json.stations : null;
+    if (!arr || !arr.length) throw new Error('noaa stations missing');
+    const out = [];
+    for (let i = 0; i < arr.length; i++) {
+      const s = arr[i];
+      const id = s && (s.id || s.stationId || s.station);
+      const lat = s && (typeof s.lat === 'number' ? s.lat : null);
+      const lng = s && (typeof s.lng === 'number' ? s.lng : (typeof s.lon === 'number' ? s.lon : null));
+      if (!id || typeof lat !== 'number' || typeof lng !== 'number') continue;
+      out.push({ id: String(id), lat: lat, lng: lng });
+    }
+    if (!out.length) throw new Error('noaa stations empty after filter');
+    saveTideStationsToStorage(out);
+    return out;
+  });
+}
+
+function getNearestTideStation(latDeg, lonDeg) {
+  const stations = State.tideStations;
+  if (!stations || !stations.length) return null;
+  let best = null;
+  let bestD = 1e30;
+  for (let i = 0; i < stations.length; i++) {
+    const s = stations[i];
+    const d = haversineMeters(latDeg, lonDeg, s.lat, s.lng);
+    if (d < bestD) {
+      bestD = d;
+      best = s;
+    }
+  }
+  if (!best) return null;
+  return { id: best.id, distM: bestD };
+}
+
+function fetchNoaaHiLoForStationGmt(stationId, nowUnix) {
+  // Fetch yesterday..tomorrow in GMT so parsing to unix is unambiguous.
+  const now = typeof nowUnix === 'number' ? nowUnix : Math.floor(Date.now() / 1000);
+  const day = 86400;
+  const begin = ymdUtcIntFromUnix(now - day);
+  const end = ymdUtcIntFromUnix(now + day);
+  const url =
+    'https://api.tidesandcurrents.noaa.gov/api/prod/datagetter' +
+    '?product=predictions' +
+    '&application=pebble-yes-watch' +
+    '&begin_date=' + encodeURIComponent(String(begin)) +
+    '&end_date=' + encodeURIComponent(String(end)) +
+    '&datum=MLLW' +
+    '&station=' + encodeURIComponent(String(stationId)) +
+    '&time_zone=gmt' +
+    '&units=metric' +
+    '&interval=hilo' +
+    '&format=json';
+  return httpGetJson(url).then((json) => {
+    const preds = json && json.predictions ? json.predictions : null;
+    if (!preds || !preds.length) throw new Error('noaa predictions missing');
+    const events = [];
+    for (let i = 0; i < preds.length; i++) {
+      const p = preds[i];
+      const ts = safeParseUnixFromNoaaGmtTime(p && p.t);
+      const type = p && (p.type || p.T || p.event || p.hl);
+      const isHigh = String(type || '').toUpperCase().indexOf('H') >= 0;
+      if (typeof ts !== 'number') continue;
+      events.push({ ts, isHigh });
+    }
+    events.sort((a, b) => a.ts - b.ts);
+    return events;
+  });
+}
+
+function computeTideWindow(events, nowUnix) {
+  if (!events || events.length < 2) return null;
+  const now = typeof nowUnix === 'number' ? nowUnix : Math.floor(Date.now() / 1000);
+  let last = null;
+  let next = null;
+  for (let i = 0; i < events.length; i++) {
+    const e = events[i];
+    if (e.ts <= now) last = e;
+    if (e.ts > now) { next = e; break; }
+  }
+  if (!last) last = events[0];
+  if (!next) next = events[events.length - 1];
+  if (!last || !next) return null;
+  if (next.ts <= last.ts) return null;
+  return { lastUnix: last.ts, nextUnix: next.ts, nextIsHigh: next.isHigh ? 1 : 0 };
+}
+
+function maybeSendTides(latE6, lonE6, force) {
+  const nowMs = Date.now();
+  const locChanged = !State.lastTideLoc ||
+    (haversineMeters(State.lastTideLoc.latE6 / 1e6, State.lastTideLoc.lonE6 / 1e6, latE6 / 1e6, lonE6 / 1e6) > 2000);
+  if (locChanged) {
+    // New station likely; allow immediate attempt.
+    State.lastTideSuccessAtMs = 0;
+    force = true;
+  }
+  State.lastTideLoc = { latE6: latE6, lonE6: lonE6 };
+
+  if (!force && nowMs - State.lastTideAttemptAtMs < 30 * 1000) return; // avoid bursts at startup
+  const sinceSuccess = nowMs - (State.lastTideSuccessAtMs || 0);
+  const sinceAttempt = nowMs - (State.lastTideAttemptAtMs || 0);
+  if (!force) {
+    if (State.lastTideSuccessAtMs && sinceSuccess < TIDE_REFRESH_MS) return;
+    if (!State.lastTideSuccessAtMs && State.lastTideAttemptAtMs && sinceAttempt < TIDE_RETRY_MS) return;
+  }
+
+  const latDeg = latE6 / 1e6;
+  const lonDeg = lonE6 / 1e6;
+
+  State.lastTideAttemptAtMs = nowMs;
+
+  const ensureStations = () => {
+    if (State.tideStations && State.tideStations.length && (nowMs - State.tideStationsFetchedAtMs) < TIDE_STATION_CACHE_MS) {
+      return Promise.resolve(State.tideStations);
+    }
+    return fetchNoaaTideStations().then((stations) => {
+      State.tideStations = stations;
+      State.tideStationsFetchedAtMs = Date.now();
+      return stations;
+    });
+  };
+
+  const nowUnix = Math.floor(nowMs / 1000);
+  ensureStations().then(() => {
+    const nearest = getNearestTideStation(latDeg, lonDeg);
+    if (!nearest || nearest.distM > TIDE_NEAR_COAST_THRESHOLD_M) {
+      const payload = {};
+      payload[KEYS.TIDE_HAVE] = 0;
+      sendQueued(payload);
+      State.lastTideSentAtMs = Date.now();
+      return;
+    }
+    log('[pkjs] tide nearest station', nearest.id, 'dist_km', Math.round(nearest.distM / 1000));
+    const useImperial = isImperialForLocation(latDeg, lonDeg);
+
+    return Promise.all([
+      fetchNoaaHiLoForStationGmt(nearest.id, nowUnix),
+      fetchNoaaLevelX10ForStationGmt(nearest.id, nowUnix, useImperial)
+    ]).then((arr) => {
+      const events = arr[0];
+      const levelX10 = arr[1];
+      const win = computeTideWindow(events, nowUnix);
+      const payload = {};
+      if (!win) {
+        payload[KEYS.TIDE_HAVE] = 0;
+      } else {
+        payload[KEYS.TIDE_HAVE] = 1;
+        payload[KEYS.TIDE_LAST_UNIX] = win.lastUnix;
+        payload[KEYS.TIDE_NEXT_UNIX] = win.nextUnix;
+        payload[KEYS.TIDE_NEXT_IS_HIGH] = win.nextIsHigh;
+        payload[KEYS.TIDE_LEVEL_X10] = levelX10 | 0;
+        payload[KEYS.TIDE_LEVEL_IS_FT] = useImperial ? 1 : 0;
+      }
+      sendQueued(payload);
+      State.lastTideSentAtMs = Date.now();
+      if (win) State.lastTideSuccessAtMs = Date.now();
+    });
+  }).catch((e) => {
+    log('[pkjs] tide fetch failed', String(e && e.message ? e.message : e));
+    const payload = {};
+    payload[KEYS.TIDE_HAVE] = 0;
+    sendQueued(payload);
+    State.lastTideSentAtMs = Date.now();
+  });
+}
+
+function maybeSendWeather(latE6, lonE6, force) {
+  const nowMs = Date.now();
+  const locChanged = !State.lastWeatherLoc ||
+    (haversineMeters(State.lastWeatherLoc.latE6 / 1e6, State.lastWeatherLoc.lonE6 / 1e6, latE6 / 1e6, lonE6 / 1e6) > 2000);
+  State.lastWeatherLoc = { latE6: latE6, lonE6: lonE6 };
+  const effectiveForce = !!force || locChanged;
+  // Throttle: avoid bursts.
+  if (!effectiveForce && (nowMs - (State.lastWeatherAttemptAtMs || 0)) < 30 * 1000) return;
+
+  const sinceSuccess = nowMs - (State.lastWeatherSuccessAtMs || 0);
+  const sinceAttempt = nowMs - (State.lastWeatherAttemptAtMs || 0);
+  if (!effectiveForce) {
+    if (State.lastWeatherSuccessAtMs && sinceSuccess < WEATHER_REFRESH_MS) return;
+    if (!State.lastWeatherSuccessAtMs && State.lastWeatherAttemptAtMs && sinceAttempt < WEATHER_RETRY_MS) return;
+  }
+  State.lastWeatherAttemptAtMs = nowMs;
+
+  const latDeg = latE6 / 1e6;
+  const lonDeg = lonE6 / 1e6;
+  const useImperial = isImperialForLocation(latDeg, lonDeg);
+  const url =
+    'https://api.open-meteo.com/v1/forecast' +
+    '?latitude=' + encodeURIComponent(String(latDeg)) +
+    '&longitude=' + encodeURIComponent(String(lonDeg)) +
+    '&current=' + encodeURIComponent('temperature_2m,weather_code,is_day,wind_speed_10m,wind_direction_10m,precipitation,uv_index,pressure_msl') +
+    '&temperature_unit=celsius' +
+    '&wind_speed_unit=' + encodeURIComponent(useImperial ? 'mph' : 'ms') +
+    '&precipitation_unit=' + encodeURIComponent(useImperial ? 'inch' : 'mm') +
+    '&timezone=UTC';
+
+  httpGetJson(url).then((json) => {
+    const cur = json && json.current ? json.current : null;
+    const temp = cur && typeof cur.temperature_2m === 'number' ? cur.temperature_2m : null;
+    const code = cur && typeof cur.weather_code === 'number' ? cur.weather_code : null;
+    const isDay = cur && (cur.is_day === 1 || cur.is_day === true) ? 1 : 0;
+    const windSpd = cur && typeof cur.wind_speed_10m === 'number' ? cur.wind_speed_10m : null;
+    const windDir = cur && typeof cur.wind_direction_10m === 'number' ? cur.wind_direction_10m : null;
+    const precip = cur && typeof cur.precipitation === 'number' ? cur.precipitation : null;
+    const uv = cur && typeof cur.uv_index === 'number' ? cur.uv_index : null;
+    const p = cur && typeof cur.pressure_msl === 'number' ? cur.pressure_msl : null;
+    if (temp === null || code === null) throw new Error('open-meteo missing current');
+    const isF = useImperial;
+
+    const payload = {};
+    payload[KEYS.WEATHER_TEMP_C10] = Math.round(temp * 10);
+    payload[KEYS.WEATHER_CODE] = Math.max(0, Math.min(255, Math.round(code)));
+    payload[KEYS.WEATHER_IS_DAY] = isDay;
+    payload[KEYS.WEATHER_IS_F] = isF ? 1 : 0;
+    if (windSpd !== null && isFinite(windSpd)) payload[KEYS.WEATHER_WIND_SPD_X10] = Math.round(windSpd * 10);
+    if (windDir !== null && isFinite(windDir)) payload[KEYS.WEATHER_WIND_DIR_DEG] = Math.max(0, Math.min(359, Math.round(windDir)));
+    if (precip !== null && isFinite(precip)) payload[KEYS.WEATHER_PRECIP_X10] = Math.round(precip * 10);
+    if (uv !== null && isFinite(uv)) payload[KEYS.WEATHER_UV_X10] = Math.round(uv * 10);
+    if (p !== null && isFinite(p)) payload[KEYS.WEATHER_PRESSURE_HPA_X10] = Math.round(p * 10);
+    sendQueued(payload);
+    State.lastWeatherSuccessAtMs = Date.now();
+    State.lastWeatherSentAtMs = Date.now();
+  }).catch((e) => {
+    log('[pkjs] weather fetch failed', String(e && e.message ? e.message : e));
+  });
+}
 
 // --- "Geo-fence" / update thresholding ---
 // Trigger recomputation+send only when location/timezone changed enough.
@@ -54,6 +428,7 @@ const DIST_THRESHOLD_M = 60000; // 60 km
 const TZ_THRESHOLD_MIN = 30;    // 30 minutes
 // If the move is unlikely to change rise/set by at least this many minutes, skip.
 const EXPECTED_SHIFT_MIN = 2;
+const LOC_REFRESH_MS = 5 * 60 * 1000; // poll GPS periodically so emulator location changes are picked up
 
 function haversineMeters(lat1, lon1, lat2, lon2) {
   const R = 6371000;
@@ -65,6 +440,66 @@ function haversineMeters(lat1, lon1, lat2, lon2) {
       Math.sin(dLon / 2) * Math.sin(dLon / 2);
   const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   return R * c;
+}
+
+function inferImperialFromLocale() {
+  // Fallback only: infer imperial from locale region (US/LR/MM).
+  let lang = '';
+  try {
+    if (Pebble.getActiveWatchInfo) {
+      const wi = Pebble.getActiveWatchInfo();
+      if (wi && wi.language) lang = String(wi.language);
+    }
+  } catch (e) {}
+  if (!lang) {
+    try { lang = String(navigator.language || ''); } catch (e) {}
+  }
+  lang = lang.replace('_', '-').toLowerCase();
+  let region = '';
+  const parts = lang.split('-');
+  if (parts.length >= 2) region = parts[1];
+  return (region === 'us' || region === 'lr' || region === 'mm');
+}
+
+function isImperialForLocation(latDeg, lonDeg) {
+  // Primary: derive units from current GPS location (US → imperial).
+  if (!isFinite(latDeg) || !isFinite(lonDeg)) return inferImperialFromLocale();
+
+  const inBox = (latMin, latMax, lonMin, lonMax) =>
+    (latDeg >= latMin && latDeg <= latMax && lonDeg >= lonMin && lonDeg <= lonMax);
+
+  // Contiguous US
+  if (inBox(24.0, 50.0, -125.0, -66.0)) return true;
+  // Alaska
+  if (inBox(51.0, 72.5, -170.0, -129.0)) return true;
+  // Hawaii
+  if (inBox(18.5, 22.6, -161.0, -154.0)) return true;
+  // Puerto Rico
+  if (inBox(17.8, 18.7, -67.4, -65.1)) return true;
+  // US Virgin Islands
+  if (inBox(17.6, 18.6, -65.3, -64.3)) return true;
+  // Guam
+  if (inBox(13.1, 13.8, 144.5, 145.1)) return true;
+  // Northern Mariana Islands
+  if (inBox(14.0, 20.8, 144.8, 146.2)) return true;
+  // American Samoa
+  if (inBox(-14.6, -10.7, -171.2, -168.0)) return true;
+
+  return false;
+}
+
+function maybeSendAltitude(position, latDeg, lonDeg) {
+  // Altitude is optional and often noisy. Send only when we have a sane value.
+  const coords = position && position.coords ? position.coords : null;
+  const alt = coords && typeof coords.altitude === 'number' ? coords.altitude : null;
+  const acc = coords && typeof coords.altitudeAccuracy === 'number' ? coords.altitudeAccuracy : null;
+  const valid = (alt !== null && isFinite(alt) && (acc === null || !isFinite(acc) || acc <= 250));
+
+  const payload = {};
+  payload[KEYS.ALT_VALID] = valid ? 1 : 0;
+  payload[KEYS.ALT_IS_FT] = isImperialForLocation(latDeg, lonDeg) ? 1 : 0;
+  if (valid) payload[KEYS.ALT_M] = Math.round(alt);
+  sendQueued(payload);
 }
 
 function expectedShiftMinutes(lat1, lon1, lat2, lon2) {
@@ -548,6 +983,39 @@ function httpGetJson(url, headers) {
   });
 }
 
+function httpGetJsonTimeout(url, timeoutMs, headers) {
+  return new Promise((resolve, reject) => {
+    try {
+      const req = new XMLHttpRequest();
+      req.open('GET', url, true);
+      try {
+        const h = headers || {};
+        Object.keys(h).forEach((k) => {
+          try { req.setRequestHeader(k, h[k]); } catch (e) {}
+        });
+      } catch (e) {}
+      req.onload = function() {
+        try {
+          if (req.status < 200 || req.status >= 300) {
+            reject(new Error('http ' + req.status));
+            return;
+          }
+          const json = JSON.parse(req.responseText);
+          resolve(json);
+        } catch (e) {
+          reject(e);
+        }
+      };
+      req.onerror = function() { reject(new Error('network error')); };
+      req.ontimeout = function() { reject(new Error('timeout')); };
+      req.timeout = Math.max(1000, (timeoutMs | 0));
+      req.send(null);
+    } catch (e) {
+      reject(e);
+    }
+  });
+}
+
 function fetchMetNoProperties(kind, latDeg, lonDeg, tzOffsetMin) {
   const ymd = ymdForOffsetMinutes(tzOffsetMin);
   const url =
@@ -713,6 +1181,12 @@ function sendLocation(position, force) {
   }
   const locUnix = Math.floor(Date.now() / 1000);
 
+  // Weather/tide should track location even when we geo-fence astro sends.
+  // If the user changes emulator location, we want this to update quickly.
+  maybeSendAltitude(position, coords.latitude, coords.longitude);
+  maybeSendTides(latE6, lonE6, !!force);
+  maybeSendWeather(latE6, lonE6, !!force);
+
   const payload = {};
   payload[KEYS.LAT_E6] = latE6;
   payload[KEYS.LON_E6] = lonE6;
@@ -737,7 +1211,11 @@ function sendLocation(position, force) {
     State.lastAstroYmd = ymdInt;
     log('[pkjs] Geo-fence: sent update');
     // Defer astro send slightly to avoid back-to-back messages at startup.
-    setTimeout(() => { sendAstroForCurrentLocation(latE6, lonE6, tzOffsetMin); }, 200);
+    setTimeout(() => {
+      sendAstroForCurrentLocation(latE6, lonE6, tzOffsetMin);
+      maybeSendTides(latE6, lonE6, true);
+      maybeSendWeather(latE6, lonE6, true);
+    }, 200);
   });
 }
 
@@ -747,23 +1225,23 @@ function requestLocation(force) {
     return;
   }
 
+  State.lastLocRequestAtMs = Date.now();
   navigator.geolocation.getCurrentPosition(
     (pos) => sendLocation(pos, !!force),
     () => { /* ignore */ },
     {
       enableHighAccuracy: false,
       timeout: 15000,
-      maximumAge: 10 * 60 * 1000
+      // If this is a forced refresh (button press / explicit request), don't accept cached coords.
+      maximumAge: force ? 0 : 10 * 60 * 1000
     }
   );
 }
 
 function maybeRefreshLocation() {
-  // Refresh at most once per hour.
+  // Refresh periodically so emulator/location changes are picked up.
   const now = Date.now();
-  if (now - State.lastSentAtMs > 60 * 60 * 1000) {
-    requestLocation(false);
-  }
+  if (now - (State.lastLocRequestAtMs || 0) > LOC_REFRESH_MS) requestLocation(false);
 }
 
 function readHomeOverrideFromStorage() {
@@ -805,7 +1283,11 @@ function sendHomeOverride() {
     saveLastLocSent(State.lastLocSent);
     State.lastAstroYmd = ymdInt;
     // Defer astro send slightly to avoid back-to-back messages at startup.
-    setTimeout(() => { sendAstroForCurrentLocation(home.latE6, home.lonE6, home.tzOffsetMin); }, 200);
+    setTimeout(() => {
+      sendAstroForCurrentLocation(home.latE6, home.lonE6, home.tzOffsetMin);
+      maybeSendTides(home.latE6, home.lonE6, true);
+      maybeSendWeather(home.latE6, home.lonE6, true);
+    }, 200);
   });
   return true;
 }
@@ -948,6 +1430,7 @@ function configHtml(homeUi, useInternet) {
 
 Pebble.addEventListener('ready', () => {
   State.lastLocSent = loadLastLocSent();
+  loadTideStationsFromStorage();
   if (State.lastLocSent && typeof State.lastLocSent.ymd === 'number') {
     State.lastAstroYmd = State.lastLocSent.ymd | 0;
   }
@@ -960,6 +1443,10 @@ Pebble.addEventListener('ready', () => {
   setInterval(() => {
     if (!sendHomeOverride()) requestLocation(false);
     maybeSendAstroForDayRollover();
+    if (State.lastLoc) {
+      maybeSendTides(State.lastLoc.latE6, State.lastLoc.lonE6, false);
+      maybeSendWeather(State.lastLoc.latE6, State.lastLoc.lonE6, false);
+    }
   }, 60 * 60 * 1000);
 });
 
