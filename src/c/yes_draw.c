@@ -861,6 +861,8 @@ static void br_draw_moon_age(const CornerCtx *c) {
   const int16_t x0 = (int16_t)(right - w);
   const GFont f = (c->min_dim >= 200) ? fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD)
                                       : fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD);
+  const GFont f_small = (c->min_dim >= 200) ? fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD)
+                                            : fonts_get_system_font(FONT_KEY_GOTHIC_09);
   const int32_t days_x10000 = (int32_t)(((int64_t)c->moon_phase_e6 * 295306LL + 500000LL) / 1000000LL);
   const int32_t days_x10 = (days_x10000 + 500) / 1000;
   const int d = (int)(days_x10 / 10);
@@ -877,6 +879,20 @@ static void br_draw_moon_age(const CornerCtx *c) {
   graphics_context_set_text_color(c->ctx, c->color_txt);
   graphics_draw_text(c->ctx, buf, f,
                      GRect(x0, ty, w, th),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentRight, NULL);
+
+  // Clarify what "Age" refers to (moon phase age).
+  const char *title = "Moon";
+  const GSize tsz2 = graphics_text_layout_get_content_size(
+    title, f_small, GRect(0, 0, w, scale_px(16, c->face_r)),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentRight
+  );
+  const int16_t th2 = (int16_t)tsz2.h;
+  const int16_t gap = scale_px(1, c->face_r);
+  int16_t ty2 = (int16_t)(ty - gap - th2);
+  if (ty2 < 0) ty2 = 0;
+  graphics_draw_text(c->ctx, title, f_small,
+                     GRect(x0, ty2, w, th2),
                      GTextOverflowModeTrailingEllipsis, GTextAlignmentRight, NULL);
 }
 
