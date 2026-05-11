@@ -4,6 +4,9 @@
   "version": "1.1.0",
   "keywords": ["yes watch", "moon phase", "sunrise", "sunset"],
   "private": true,
+  "scripts": {
+    "screenshot": "scripts/screenshot.sh"
+  },
   "dependencies": {},
   "pebble": {
     "displayName": "Yes Watch",
@@ -15,7 +18,8 @@
       "chalk",
       "diorite",
       "emery",
-      "flint"
+      "flint",
+      "gabbro"
     ],
     "watchapp": {
       "watchface": true

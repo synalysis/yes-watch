@@ -3,10 +3,14 @@
 #include <pebble.h>
 #include "yes_types.h"
 
+#ifndef ENABLE_DEBUG_SCREEN
+#define ENABLE_DEBUG_SCREEN 0
+#endif
+
 void yes_draw_init(void);
 void yes_draw_deinit(void);
 
-// Draw the full watchface (including debug/loading screens). Intended for the main layer.
+// Draw the full watchface (including the loading screen). Intended for the main layer.
 void yes_draw_face(Layer *layer, GContext *ctx,
                      bool debug,
                      bool net_on,

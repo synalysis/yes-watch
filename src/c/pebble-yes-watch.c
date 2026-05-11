@@ -19,7 +19,9 @@ static Layer *s_canvas_layer;
 static Layer *s_corner_layer;
 #endif
 static AppTimer *s_startup_timer;
+#if ENABLE_DEBUG_SCREEN
 static bool s_debug;
+#endif
 
 // --- Watch-side fallback computations ---
 // This is now libm-free (uses Pebble fixed-point trig in yes_astro.c), so we can keep
@@ -620,9 +622,8 @@ static void tick_handler(struct tm *tick_time, TimeUnits units_changed) {
   }
 }
 
-static void down_long_click_handler(ClickRecognizerRef recognizer, void *context) {
-  (void)recognizer; (void)context;
-  // Fallback for emulators/keymaps where Select isn't easily accessible.
+#if ENABLE_DEBUG_SCREEN
+static void debug_toggle(void) {
   s_debug = !s_debug;
   if (s_canvas_layer) {
     layer_mark_dirty(s_canvas_layer);
@@ -632,6 +633,12 @@ static void down_long_click_handler(ClickRecognizerRef recognizer, void *context
 #endif
 }
 
+static void down_raw_up_handler(ClickRecognizerRef recognizer, void *context) {
+  (void)recognizer; (void)context;
+  debug_toggle();
+}
+#endif
+
 static void down_click_handler(ClickRecognizerRef recognizer, void *context) {
   (void)recognizer; (void)context;
   request_location();
@@ -640,7 +647,13 @@ static void down_click_handler(ClickRecognizerRef recognizer, void *context) {
 static void click_config_provider(void *context) {
   (void)context;
   // Use raw clicks to avoid system Timeline stealing button presses in some emulators.
-  window_raw_click_subscribe(BUTTON_ID_DOWN, down_click_handler, down_long_click_handler, NULL);
+  window_raw_click_subscribe(BUTTON_ID_DOWN, down_click_handler,
+#if ENABLE_DEBUG_SCREEN
+                             down_raw_up_handler,
+#else
+                             NULL,
+#endif
+                             NULL);
 }
 
 static void canvas_update_proc(Layer *layer, GContext *ctx) {
@@ -648,7 +661,11 @@ static void canvas_update_proc(Layer *layer, GContext *ctx) {
   const bool have_sun = s_sun_home.valid;
   const bool have_moon = s_moon_home.valid;
   yes_draw_face(layer, ctx,
+#if ENABLE_DEBUG_SCREEN
                 s_debug,
+#else
+                false,
+#endif
                 s_use_internet_fallback,
                 have_loc,
                 have_sun,
@@ -687,7 +704,11 @@ static void corner_update_proc(Layer *layer, GContext *ctx) {
   const bool have_sun = s_sun_home.valid;
   const bool have_moon = s_moon_home.valid;
   yes_draw_corners(layer, ctx,
+#if ENABLE_DEBUG_SCREEN
                    s_debug,
+#else
+                   false,
+#endif
                    have_loc,
                    have_sun,
                    have_moon,
@@ -753,16 +774,12 @@ static void prv_window_unload(Window *window) {
   yes_draw_deinit();
 }
 
+#if ENABLE_DEBUG_SCREEN
 static void accel_tap_handler(AccelAxisType axis, int32_t direction) {
   (void)axis; (void)direction;
-  s_debug = !s_debug;
-  if (s_canvas_layer) {
-    layer_mark_dirty(s_canvas_layer);
-  }
-#ifndef PBL_ROUND
-  if (s_corner_layer) layer_mark_dirty(s_corner_layer);
-#endif
+  debug_toggle();
 }
+#endif
 
 #ifndef PBL_ROUND
 static void bt_handler(bool connected) {
@@ -892,7 +909,9 @@ static void prv_init(void) {
   window_stack_push(s_window, animated);
 
   tick_timer_service_subscribe(MINUTE_UNIT, tick_handler);
+#if ENABLE_DEBUG_SCREEN
   accel_tap_service_subscribe(accel_tap_handler);
+#endif
 
   // Ask phone for location (and it will also send sun/moon event times)
   // done via startup timer in window_load
@@ -902,7 +921,9 @@ static void prv_init(void) {
 
 static void prv_deinit(void) {
   tick_timer_service_unsubscribe();
+#if ENABLE_DEBUG_SCREEN
   accel_tap_service_unsubscribe();
+#endif
   if (s_fallback_calc_timer) {
     app_timer_cancel(s_fallback_calc_timer);
     s_fallback_calc_timer = NULL;

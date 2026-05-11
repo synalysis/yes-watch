@@ -61,6 +61,7 @@ static bool angle_in_sweep(int32_t a, int32_t start, int32_t end) {
   return (a >= start || a <= end);
 }
 
+#if ENABLE_DEBUG_SCREEN
 static void format_deg2_from_e6(char *out, size_t out_sz, int32_t e6) {
   int32_t v = e6;
   const char sign = (v < 0) ? '-' : '+';
@@ -68,6 +69,21 @@ static void format_deg2_from_e6(char *out, size_t out_sz, int32_t e6) {
   const int32_t whole = v / 1000000;
   const int32_t frac2 = (v % 1000000) / 10000; // 2 decimals
   snprintf(out, out_sz, "%c%ld.%02ld", sign, (long)whole, (long)frac2);
+}
+#endif
+
+static void format_clock_time(char *out, size_t out_sz, const struct tm *tm_p, bool is24) {
+  if (!tm_p) {
+    snprintf(out, out_sz, "--:--");
+    return;
+  }
+
+  int hour = tm_p->tm_hour;
+  if (!is24) {
+    hour %= 12;
+    if (hour == 0) hour = 12;
+  }
+  snprintf(out, out_sz, "%d:%02d", hour, tm_p->tm_min);
 }
 
 static void fill_radial_wedge(GContext *ctx, GRect bounds, uint16_t inset,
@@ -1108,6 +1124,7 @@ void yes_draw_face(Layer *layer, GContext *ctx,
   graphics_context_set_fill_color(ctx, GColorBlack);
   graphics_fill_rect(ctx, bounds, 0, GCornerNone);
 
+#if ENABLE_DEBUG_SCREEN
   if (debug) {
     char buf0[32], buf1[32], buf2[32], buf3[32], buf4[32], buf5[32];
 
@@ -1116,8 +1133,7 @@ void yes_draw_face(Layer *layer, GContext *ctx,
       time_t now_utc = time(NULL);
       time_t shifted = now_utc + (time_t)loc->tz_offset_min * 60;
       struct tm *tm_p = gmtime(&shifted);
-      if (tm_p) strftime(time_buf, sizeof(time_buf), clock_is_24h_style() ? "%H:%M" : "%I:%M", tm_p);
-      else strcpy(time_buf, "--:--");
+      format_clock_time(time_buf, sizeof(time_buf), tm_p, clock_is_24h_style());
     } else {
       strcpy(time_buf, "--:--");
     }
@@ -1241,6 +1257,10 @@ void yes_draw_face(Layer *layer, GContext *ctx,
                        GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
     return;
   }
+#else
+  (void)debug;
+  (void)net_on;
+#endif
 
   // Loading/progress screen: avoid flashing obviously wrong times while data is still arriving.
   if (!(have_loc && have_sun && have_moon)) {
@@ -1483,7 +1503,7 @@ void yes_draw_face(Layer *layer, GContext *ctx,
     struct tm *tm_p = gmtime(&shifted);
     if (tm_p) {
       const bool is24 = clock_is_24h_style();
-      strftime(time_buf, sizeof(time_buf), is24 ? "%H:%M" : "%I:%M", tm_p);
+      format_clock_time(time_buf, sizeof(time_buf), tm_p, is24);
       if (!is24) {
         strftime(ampm_buf, sizeof(ampm_buf), "%p", tm_p);
       }
@@ -1503,9 +1523,9 @@ void yes_draw_face(Layer *layer, GContext *ctx,
     // On both color and B/W: black on day, white on night.
     const GColor time_col = top_is_night ? GColorWhite : GColorBlack;
     graphics_context_set_text_color(ctx, time_col);
-    const GFont f_time = (min_dim >= 200) ? fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD)
-                                          : fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD);
-    const int16_t time_h = (min_dim >= 200) ? scale_px(30, face_r) : scale_px(24, face_r);
+    const GFont f_time = (min_dim >= 200) ? fonts_get_system_font(FONT_KEY_GOTHIC_28_BOLD)
+                                          : fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD);
+    const int16_t time_h = (min_dim >= 200) ? scale_px(34, face_r) : scale_px(28, face_r);
 
     const GRect time_rect = GRect(0, (int16_t)(y_center - time_h / 2), bounds.size.w, time_h);
     graphics_draw_text(ctx, time_buf, f_time,
