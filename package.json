@@ -1,11 +1,15 @@
 {
   "name": "pebble-yes-watch",
   "author": "Andreas Pehnack",
-  "version": "1.1.0",
+  "version": "1.2.3",
   "keywords": ["yes watch", "moon phase", "sunrise", "sunset"],
   "private": true,
   "scripts": {
-    "screenshot": "scripts/screenshot.sh"
+    "screenshot": "scripts/screenshot.sh",
+    "screenshots": "scripts/screenshot.sh all",
+    "gifs": "scripts/screenshot.sh all --gif",
+    "config": "scripts/open-config.sh",
+    "config:emu": "scripts/open-config.sh basalt"
   },
   "dependencies": {},
   "pebble": {
@@ -20,6 +24,11 @@
       "emery",
       "flint",
       "gabbro"
+    ],
+    "capabilities": [
+      "configurable",
+      "location",
+      "health"
     ],
     "watchapp": {
       "watchface": true
@@ -56,7 +65,9 @@
       "KEY_WEATHER_PRECIP_X10",
       "KEY_WEATHER_UV_X10",
       "KEY_WEATHER_PRESSURE_HPA_X10",
-      "KEY_USE_INTERNET_FALLBACK"
+      "KEY_USE_INTERNET_FALLBACK",
+      "KEY_UI_UPDATE_INTERVAL_SEC",
+      "KEY_LANGUAGE"
     ],
     "resources": {
       "media": []

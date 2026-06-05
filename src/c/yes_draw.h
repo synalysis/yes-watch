@@ -73,6 +73,7 @@ void yes_draw_corners(Layer *layer, GContext *ctx,
                       int16_t weather_pressure_hpa_x10,
                       bool have_phase,
                       int32_t moon_phase_e6,
+                      int ui_update_interval_sec,
                       const GeoLoc *loc,
                       const SunTimes *sun,
                       const MoonTimes *moon);

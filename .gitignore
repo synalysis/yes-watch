@@ -2,6 +2,7 @@
 .lock-waf_*
 build/
 node_modules/
+scripts/__pycache__
 
 # Editor/OS noise
 .vscode/

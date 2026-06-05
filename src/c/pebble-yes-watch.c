@@ -5,6 +5,7 @@
 #include "yes_types.h"
 #include "yes_astro.h"
 #include "yes_draw.h"
+#include "yes_i18n.h"
 
 // Pebble/newlib toolchain can omit errno plumbing; libm references __errno for some functions.
 // Provide a minimal stub to satisfy the linker.
@@ -48,6 +49,8 @@ enum {
 
   // Debug/behavior flags (sent from phone config)
   PERSIST_USE_INTERNET_FALLBACK = 140,
+  PERSIST_UI_UPDATE_INTERVAL_SEC = 141,
+  PERSIST_LANGUAGE = 142,
 
   // Tides (US-only NOAA; phone sends data when a nearby station is within 50km)
   PERSIST_TIDE_HAVE = 150,
@@ -76,6 +79,8 @@ enum {
 
 static GeoLoc s_home;
 static bool s_use_internet_fallback;
+static int s_ui_update_interval_sec = 5;
+static int s_language = YES_LANG_EN;
 
 static SunTimes s_sun_home;
 
@@ -112,7 +117,7 @@ static uint8_t s_battery_percent = 100;
 static AppTimer *s_corner_timer;
 
 #ifndef PBL_ROUND
-// UI alternation timer: wake only on 5-second boundaries (rect watches only).
+// UI alternation timer: wake on configured cadence boundaries (rect watches only).
 static AppTimer *s_ui_timer;
 static void schedule_ui_timer(void);
 #endif
@@ -145,6 +150,11 @@ static CalcPhase s_calc_phase = CALC_PHASE_NONE;
 
 // Note: we no longer calculate sunrise/moonrise on-watch (too expensive on emulator/slow paths).
 // Phone-side JS computes and sends event times; the watch only renders.
+
+static int normalize_ui_update_interval_sec(int sec) {
+  if (sec == 10 || sec == 30 || sec == 60) return sec;
+  return 5;
+}
 
 static const GeoLoc* active_loc(void) {
   return &s_home;
@@ -312,6 +322,8 @@ static void inbox_received(DictionaryIterator *iter, void *context) {
   Tuple *t_w_uv = dict_find(iter, MESSAGE_KEY_KEY_WEATHER_UV_X10);
   Tuple *t_w_p = dict_find(iter, MESSAGE_KEY_KEY_WEATHER_PRESSURE_HPA_X10);
   Tuple *t_use_internet = dict_find(iter, MESSAGE_KEY_KEY_USE_INTERNET_FALLBACK);
+  Tuple *t_ui_update_interval = dict_find(iter, MESSAGE_KEY_KEY_UI_UPDATE_INTERVAL_SEC);
+  Tuple *t_language = dict_find(iter, MESSAGE_KEY_KEY_LANGUAGE);
 
   bool changed = false;
   if (t_lat && t_lon) {
@@ -333,6 +345,29 @@ static void inbox_received(DictionaryIterator *iter, void *context) {
     s_use_internet_fallback = (t_use_internet->value->uint8 != 0);
     persist_write_int(PERSIST_USE_INTERNET_FALLBACK, s_use_internet_fallback ? 1 : 0);
     changed = true;
+  }
+  if (t_ui_update_interval) {
+    const int next_interval = normalize_ui_update_interval_sec((int)t_ui_update_interval->value->int32);
+    if (s_ui_update_interval_sec != next_interval) {
+      s_ui_update_interval_sec = next_interval;
+      persist_write_int(PERSIST_UI_UPDATE_INTERVAL_SEC, s_ui_update_interval_sec);
+      changed = true;
+#ifndef PBL_ROUND
+      if (s_ui_timer) {
+        app_timer_cancel(s_ui_timer);
+        s_ui_timer = NULL;
+      }
+#endif
+    }
+  }
+  if (t_language) {
+    const int next_language = yes_i18n_normalize_language((int)t_language->value->int32);
+    if (s_language != next_language) {
+      s_language = next_language;
+      yes_i18n_set_language(s_language);
+      persist_write_int(PERSIST_LANGUAGE, s_language);
+      changed = true;
+    }
   }
 
   // Home events
@@ -480,7 +515,7 @@ static void inbox_received(DictionaryIterator *iter, void *context) {
       layer_mark_dirty(s_corner_layer);
     }
 #endif
-    // Kick the 5s UI alternation timer for corner widgets (tide/weather).
+    // Kick the UI alternation timer for corner widgets (tide/weather).
 #ifndef PBL_ROUND
     schedule_ui_timer();
 #endif
@@ -495,9 +530,9 @@ static void inbox_received(DictionaryIterator *iter, void *context) {
 static void schedule_ui_timer(void);
 
 static bool ui_timer_needed(void) {
-  // Run a 5s redraw timer when any corner widget needs sub-minute alternation.
-  // - weather corner cycles every 5s when weather is present
-  // - tide corner cycles every 5s when tide is present
+  // Run a redraw timer when any corner widget needs configured-cadence alternation.
+  // - weather corner cycles when weather is present
+  // - tide corner cycles when tide is present
   // - top-left alternates steps/battery when battery_alert is true
   // - bottom-right fallback cycles between sun/moon/phase (when tide absent)
   if (s_have_weather) return true;
@@ -520,9 +555,10 @@ static void ui_timer_cb(void *context) {
 static void schedule_ui_timer(void) {
   if (s_ui_timer) return;
   if (!ui_timer_needed()) return;
+  const int interval = normalize_ui_update_interval_sec(s_ui_update_interval_sec);
   const time_t now = time(NULL);
-  const int sec = (int)(now % 5);
-  const uint32_t ms = (uint32_t)((sec == 0 ? 5 : (5 - sec)) * 1000);
+  const int sec = (int)(now % interval);
+  const uint32_t ms = (uint32_t)((sec == 0 ? interval : (interval - sec)) * 1000);
   s_ui_timer = app_timer_register(ms, ui_timer_cb, NULL);
 }
 #endif
@@ -587,7 +623,7 @@ static void corner_timer_cb(void *context) {
     if (s_corner_layer) layer_mark_dirty(s_corner_layer);
   }
 
-  schedule_corner_timer(alert ? 5000 : 60000);
+  schedule_corner_timer(alert ? (uint32_t)normalize_ui_update_interval_sec(s_ui_update_interval_sec) * 1000 : 60000);
 }
 
 static void schedule_corner_timer(uint32_t ms) {
@@ -605,7 +641,7 @@ static void battery_handler(BatteryChargeState state) {
   s_battery_alert = alert;
   if (changed && s_corner_layer) layer_mark_dirty(s_corner_layer);
   // Re-evaluate quickly after changes.
-  schedule_corner_timer(alert ? 5000 : 1000);
+  schedule_corner_timer(alert ? (uint32_t)normalize_ui_update_interval_sec(s_ui_update_interval_sec) * 1000 : 1000);
 }
 #endif // !PBL_ROUND
 
@@ -735,6 +771,7 @@ static void corner_update_proc(Layer *layer, GContext *ctx) {
                    s_weather_pressure_hpa_x10,
                    s_have_moon_phase,
                    s_moon_phase_e6,
+                   s_ui_update_interval_sec,
                    active_loc(),
                    active_sun(),
                    active_moon());
@@ -804,6 +841,13 @@ static void prv_init(void) {
 
   // Settings from phone config (optional)
   s_use_internet_fallback = persist_exists(PERSIST_USE_INTERNET_FALLBACK) ? (persist_read_int(PERSIST_USE_INTERNET_FALLBACK) != 0) : false;
+  s_ui_update_interval_sec = persist_exists(PERSIST_UI_UPDATE_INTERVAL_SEC)
+    ? normalize_ui_update_interval_sec(persist_read_int(PERSIST_UI_UPDATE_INTERVAL_SEC))
+    : 5;
+  s_language = persist_exists(PERSIST_LANGUAGE)
+    ? yes_i18n_normalize_language(persist_read_int(PERSIST_LANGUAGE))
+    : YES_LANG_EN;
+  yes_i18n_set_language(s_language);
   s_last_calc_year = s_last_calc_month = s_last_calc_day = -1;
   clear_events();
   s_have_moon_phase = false;
@@ -833,7 +877,7 @@ static void prv_init(void) {
   // On round watches we don't render corner complications; avoid extra timers/redraws.
 #ifndef PBL_ROUND
   battery_state_service_subscribe(battery_handler);
-  schedule_corner_timer(s_battery_alert ? 5000 : 60000);
+  schedule_corner_timer(s_battery_alert ? (uint32_t)normalize_ui_update_interval_sec(s_ui_update_interval_sec) * 1000 : 60000);
   bluetooth_connection_service_subscribe(bt_handler);
 #endif
 
@@ -861,7 +905,7 @@ static void prv_init(void) {
   }
 
 #ifndef PBL_ROUND
-  // If we boot with cached tide/weather, ensure the 5s UI timer starts.
+  // If we boot with cached tide/weather, ensure the UI timer starts.
   schedule_ui_timer();
 #endif
 

@@ -63,8 +63,9 @@ You can target other emulators (`aplite`, `diorite`, `flint`, `chalk`, `emery`, 
 
 The phone companion provides a simple config page:
 
-- Optional **Home override** (useful for emulator testing)
 - “**Use Internet (MET Norway) for rise/set**” (preferred; falls back to local computation on failure)
+- **Units**: metric (Celsius, km/h) or imperial (Fahrenheit, mph), defaulting from the existing location heuristic
+- **Corner update cycle**: 5s, 10s, 30s, or 60s
 
 ## Code layout
 

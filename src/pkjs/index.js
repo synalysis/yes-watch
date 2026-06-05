@@ -47,7 +47,9 @@ const KEYS = {
   WEATHER_UV_X10: 'KEY_WEATHER_UV_X10',
   WEATHER_PRESSURE_HPA_X10: 'KEY_WEATHER_PRESSURE_HPA_X10',
 
-  USE_INTERNET_FALLBACK: 'KEY_USE_INTERNET_FALLBACK'
+  USE_INTERNET_FALLBACK: 'KEY_USE_INTERNET_FALLBACK',
+  UI_UPDATE_INTERVAL_SEC: 'KEY_UI_UPDATE_INTERVAL_SEC',
+  LANGUAGE: 'KEY_LANGUAGE'
 };
 
 function log() {
@@ -89,6 +91,16 @@ const TIDE_RETRY_MS = 2 * 60 * 1000; // retry quickly on failure
 
 const WEATHER_REFRESH_MS = 30 * 60 * 1000; // weather doesn't need to be frequent
 const WEATHER_RETRY_MS = 2 * 60 * 1000; // retry quickly on failure
+const UPDATE_INTERVAL_CHOICES_SEC = [5, 10, 30, 60];
+const LANGUAGE_IDS = { en: 0, de: 1, fr: 2, es: 3, pt: 4, it: 5 };
+const LANGUAGE_LABELS = {
+  en: 'English',
+  de: 'Deutsch',
+  fr: 'Français',
+  es: 'Español',
+  pt: 'Português',
+  it: 'Italiano'
+};
 
 function loadTideStationsFromStorage() {
   try {
@@ -326,7 +338,7 @@ function maybeSendTides(latE6, lonE6, force) {
       return;
     }
     log('[pkjs] tide nearest station', nearest.id, 'dist_km', Math.round(nearest.distM / 1000));
-    const useImperial = isImperialForLocation(latDeg, lonDeg);
+    const useImperial = useImperialUnits(latDeg, lonDeg);
 
     return Promise.all([
       fetchNoaaHiLoForStationGmt(nearest.id, nowUnix),
@@ -378,14 +390,14 @@ function maybeSendWeather(latE6, lonE6, force) {
 
   const latDeg = latE6 / 1e6;
   const lonDeg = lonE6 / 1e6;
-  const useImperial = isImperialForLocation(latDeg, lonDeg);
+  const useImperial = useImperialUnits(latDeg, lonDeg);
   const url =
     'https://api.open-meteo.com/v1/forecast' +
     '?latitude=' + encodeURIComponent(String(latDeg)) +
     '&longitude=' + encodeURIComponent(String(lonDeg)) +
     '&current=' + encodeURIComponent('temperature_2m,weather_code,is_day,wind_speed_10m,wind_direction_10m,precipitation,uv_index,pressure_msl') +
     '&temperature_unit=celsius' +
-    '&wind_speed_unit=' + encodeURIComponent(useImperial ? 'mph' : 'ms') +
+    '&wind_speed_unit=' + encodeURIComponent(useImperial ? 'mph' : 'kmh') +
     '&precipitation_unit=' + encodeURIComponent(useImperial ? 'inch' : 'mm') +
     '&timezone=UTC';
 
@@ -442,8 +454,7 @@ function haversineMeters(lat1, lon1, lat2, lon2) {
   return R * c;
 }
 
-function inferImperialFromLocale() {
-  // Fallback only: infer imperial from locale region (US/LR/MM).
+function getPreferredLanguageTag() {
   let lang = '';
   try {
     if (Pebble.getActiveWatchInfo) {
@@ -454,7 +465,43 @@ function inferImperialFromLocale() {
   if (!lang) {
     try { lang = String(navigator.language || ''); } catch (e) {}
   }
-  lang = lang.replace('_', '-').toLowerCase();
+  return String(lang || 'en').replace('_', '-').toLowerCase();
+}
+
+function normalizeLanguageCode(lang) {
+  const code = String(lang || '').replace('_', '-').toLowerCase().split('-')[0];
+  return Object.prototype.hasOwnProperty.call(LANGUAGE_IDS, code) ? code : 'en';
+}
+
+function detectedLanguageCode() {
+  return normalizeLanguageCode(getPreferredLanguageTag());
+}
+
+function readLanguageFromStorage() {
+  try {
+    const stored = localStorage.getItem('language');
+    if (stored) return normalizeLanguageCode(stored);
+  } catch (e) {}
+  return detectedLanguageCode();
+}
+
+function currentLanguageCode() {
+  return readLanguageFromStorage();
+}
+
+function currentLanguageId() {
+  return LANGUAGE_IDS[currentLanguageCode()] || 0;
+}
+
+function sendLanguage() {
+  const payload = {};
+  payload[KEYS.LANGUAGE] = currentLanguageId();
+  sendQueued(payload);
+}
+
+function inferImperialFromLocale() {
+  // Fallback only: infer imperial from locale region (US/LR/MM).
+  const lang = getPreferredLanguageTag();
   let region = '';
   const parts = lang.split('-');
   if (parts.length >= 2) region = parts[1];
@@ -488,6 +535,62 @@ function isImperialForLocation(latDeg, lonDeg) {
   return false;
 }
 
+function normalizeUnitsMode(v) {
+  return (v === 'metric' || v === 'imperial') ? v : null;
+}
+
+function defaultUnitsMode(latDeg, lonDeg) {
+  if (isFinite(latDeg) && isFinite(lonDeg)) {
+    return isImperialForLocation(latDeg, lonDeg) ? 'imperial' : 'metric';
+  }
+  if (State.lastLoc) {
+    return isImperialForLocation(State.lastLoc.latE6 / 1e6, State.lastLoc.lonE6 / 1e6) ? 'imperial' : 'metric';
+  }
+  return inferImperialFromLocale() ? 'imperial' : 'metric';
+}
+
+function readUnitsModeFromStorage(latDeg, lonDeg) {
+  try {
+    const stored = normalizeUnitsMode(localStorage.getItem('unitsMode'));
+    if (stored) return stored;
+  } catch (e) {}
+  return defaultUnitsMode(latDeg, lonDeg);
+}
+
+function useImperialUnits(latDeg, lonDeg) {
+  return readUnitsModeFromStorage(latDeg, lonDeg) === 'imperial';
+}
+
+function normalizeUpdateIntervalSec(v) {
+  const n = parseInt(v, 10);
+  for (let i = 0; i < UPDATE_INTERVAL_CHOICES_SEC.length; i++) {
+    if (n === UPDATE_INTERVAL_CHOICES_SEC[i]) return n;
+  }
+  return 5;
+}
+
+function readUpdateIntervalSecFromStorage() {
+  try {
+    const v = localStorage.getItem('uiUpdateIntervalSec');
+    if (v === null || typeof v === 'undefined') return 5;
+    return normalizeUpdateIntervalSec(v);
+  } catch (e) {
+    return 5;
+  }
+}
+
+function sendUiUpdateInterval() {
+  const payload = {};
+  payload[KEYS.UI_UPDATE_INTERVAL_SEC] = readUpdateIntervalSecFromStorage();
+  sendQueued(payload);
+}
+
+function sendAltitudeUnitForLocation(latE6, lonE6) {
+  const payload = {};
+  payload[KEYS.ALT_IS_FT] = useImperialUnits(latE6 / 1e6, lonE6 / 1e6) ? 1 : 0;
+  sendQueued(payload);
+}
+
 function maybeSendAltitude(position, latDeg, lonDeg) {
   // Altitude is optional and often noisy. Send only when we have a sane value.
   const coords = position && position.coords ? position.coords : null;
@@ -497,7 +600,7 @@ function maybeSendAltitude(position, latDeg, lonDeg) {
 
   const payload = {};
   payload[KEYS.ALT_VALID] = valid ? 1 : 0;
-  payload[KEYS.ALT_IS_FT] = isImperialForLocation(latDeg, lonDeg) ? 1 : 0;
+  payload[KEYS.ALT_IS_FT] = useImperialUnits(latDeg, lonDeg) ? 1 : 0;
   if (valid) payload[KEYS.ALT_M] = Math.round(alt);
   sendQueued(payload);
 }
@@ -1095,6 +1198,88 @@ function maybeSendAstroForDayRollover() {
   }
 }
 
+const LOCATION_CITY_CACHE_MAX_M = 5000;
+const NOMINATIM_HEADERS = {
+  'User-Agent': 'pebble-yes-watch/1.0 (pebble pkjs)'
+};
+
+function formatCoordsLabel(latE6, lonE6) {
+  const lat = latE6 / 1e6;
+  const lon = lonE6 / 1e6;
+  if (!isFinite(lat) || !isFinite(lon)) return '';
+  return lat.toFixed(4) + '°, ' + lon.toFixed(4) + '°';
+}
+
+function pickCityFromNominatim(json) {
+  const address = json && json.address;
+  if (!address) return null;
+  const city = address.city || address.town || address.village || address.hamlet ||
+    address.municipality || address.suburb || address.county || address.state_district || address.state;
+  return city ? String(city) : null;
+}
+
+function readCachedCityForLocation(latE6, lonE6) {
+  try {
+    const city = localStorage.getItem('locationCityName');
+    const cachedLatE6 = parseInt(localStorage.getItem('locationCityLatE6') || '', 10);
+    const cachedLonE6 = parseInt(localStorage.getItem('locationCityLonE6') || '', 10);
+    if (!city || !isFinite(cachedLatE6) || !isFinite(cachedLonE6)) return null;
+    if (cachedLatE6 === latE6 && cachedLonE6 === lonE6) return city;
+    const d = haversineMeters(cachedLatE6 / 1e6, cachedLonE6 / 1e6, latE6 / 1e6, lonE6 / 1e6);
+    if (d < LOCATION_CITY_CACHE_MAX_M) return city;
+  } catch (e) {}
+  return null;
+}
+
+function saveCachedCity(latE6, lonE6, city) {
+  if (!city) return;
+  try {
+    localStorage.setItem('locationCityName', city);
+    localStorage.setItem('locationCityLatE6', String(latE6));
+    localStorage.setItem('locationCityLonE6', String(lonE6));
+  } catch (e) {}
+}
+
+function currentLocationRecord() {
+  return State.lastLoc || State.lastLocSent || loadLastLocSent();
+}
+
+function maybeUpdateLocationLabel(latE6, lonE6) {
+  if (!isFinite(latE6) || !isFinite(lonE6)) return;
+  if (readCachedCityForLocation(latE6, lonE6)) return;
+
+  const url =
+    'https://nominatim.openstreetmap.org/reverse?format=json&addressdetails=1&zoom=10' +
+    '&lat=' + encodeURIComponent(String(latE6 / 1e6)) +
+    '&lon=' + encodeURIComponent(String(lonE6 / 1e6));
+
+  httpGetJsonTimeout(url, 10000, NOMINATIM_HEADERS).then((json) => {
+    const city = pickCityFromNominatim(json);
+    if (city) saveCachedCity(latE6, lonE6, city);
+  }).catch(() => {
+    // Coordinates remain the fallback on the settings page.
+  });
+}
+
+function getLocationDisplayForConfig() {
+  const L = configStrings();
+  const loc = currentLocationRecord();
+  if (!loc || !isFinite(loc.latE6) || !isFinite(loc.lonE6)) {
+    return L.locationUnknown;
+  }
+  const city = readCachedCityForLocation(loc.latE6, loc.lonE6);
+  if (city) return L.closestCity + ': ' + city;
+  return formatCoordsLabel(loc.latE6, loc.lonE6);
+}
+
+function escapeHtmlForConfig(value) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
 function readUseInternetFromStorage() {
   try {
     const v = localStorage.getItem('useInternet');
@@ -1151,9 +1336,6 @@ function sendAstroForCurrentLocation(latE6, lonE6, tzOffsetMin) {
 }
 
 function sendLocation(position, force) {
-  // If user configured a Home override (useful for emulator/VPN), prefer it.
-  if (sendHomeOverride()) return;
-
   const coords = position.coords;
   if (!coords || typeof coords.latitude !== 'number' || typeof coords.longitude !== 'number' ||
       !isFinite(coords.latitude) || !isFinite(coords.longitude)) {
@@ -1195,6 +1377,7 @@ function sendLocation(position, force) {
   payload[KEYS.USE_INTERNET_FALLBACK] = readUseInternetFromStorage() ? 1 : 0;
 
   State.lastLoc = { latE6: latE6, lonE6: lonE6, tzOffsetMin: tzOffsetMin };
+  maybeUpdateLocationLabel(latE6, lonE6);
 
   const doSend = shouldSendUpdate(latE6, lonE6, tzOffsetMin, !!force);
   if (!doSend) {
@@ -1220,7 +1403,6 @@ function sendLocation(position, force) {
 }
 
 function requestLocation(force) {
-  if (sendHomeOverride()) return;
   if (!navigator.geolocation) {
     return;
   }
@@ -1244,73 +1426,146 @@ function maybeRefreshLocation() {
   if (now - (State.lastLocRequestAtMs || 0) > LOC_REFRESH_MS) requestLocation(false);
 }
 
-function readHomeOverrideFromStorage() {
-  try {
-    const raw = localStorage.getItem('home');
-    if (!raw) return null;
-    const obj = JSON.parse(raw);
-    if (!obj || !obj.valid) return { valid: false };
-    if (typeof obj.latE6 !== 'number' || typeof obj.lonE6 !== 'number' || typeof obj.tzOffsetMin !== 'number') {
-      return { valid: false };
-    }
-    return {
-      valid: true,
-      latE6: (obj.latE6 | 0),
-      lonE6: (obj.lonE6 | 0),
-      tzOffsetMin: (obj.tzOffsetMin | 0)
-    };
-  } catch (e) {
-    return null;
+const CONFIG_I18N = {
+  en: {
+    title: 'YES Watchface Settings',
+    useInternet: 'Use Internet (MET Norway) for rise/set',
+    useInternetHint: 'If enabled, the phone will fetch sun/moon rise/set from the Internet when possible, and fall back to local calculations if needed.',
+    units: 'Units',
+    metric: 'Metric (Celsius, km/h)',
+    imperial: 'Imperial (Fahrenheit, mph)',
+    unitsHint: 'Defaults to the current location heuristic until you save a choice.',
+    updateCycle: 'Corner update cycle',
+    updateHint: 'Higher values reduce corner redraws and slow complication rotation.',
+    language: 'Language',
+    languageHint: 'Defaults to your phone or watch language until you save a choice.',
+    location: 'Location',
+    closestCity: 'Closest city',
+    locationUnknown: 'Location not available yet',
+    seconds: 'seconds',
+    save: 'Save'
+  },
+  de: {
+    title: 'YES Watchface Einstellungen',
+    useInternet: 'Internet (MET Norway) für Auf-/Untergang nutzen',
+    useInternetHint: 'Wenn aktiv, holt das Telefon Sonnen-/Mondzeiten aus dem Internet und nutzt sonst lokale Berechnung.',
+    units: 'Einheiten',
+    metric: 'Metrisch (Celsius, km/h)',
+    imperial: 'Imperial (Fahrenheit, mph)',
+    unitsHint: 'Standard wird aus der aktuellen Position abgeleitet, bis du speicherst.',
+    updateCycle: 'Aktualisierung der Ecken',
+    updateHint: 'Höhere Werte reduzieren Neuzeichnen und verlangsamen die Rotation.',
+    language: 'Sprache',
+    languageHint: 'Standard ist die erkannte Telefon- oder Uhrensprache, bis du speicherst.',
+    location: 'Standort',
+    closestCity: 'Nächste Stadt',
+    locationUnknown: 'Standort noch nicht verfügbar',
+    seconds: 'Sekunden',
+    save: 'Speichern'
+  },
+  fr: {
+    title: 'Paramètres YES Watchface',
+    useInternet: 'Utiliser Internet (MET Norway) pour lever/coucher',
+    useInternetHint: 'Si activé, le téléphone récupère les heures soleil/lune en ligne et utilise le calcul local en secours.',
+    units: 'Unités',
+    metric: 'Metrique (Celsius, km/h)',
+    imperial: 'Imperial (Fahrenheit, mph)',
+    unitsHint: 'Par défaut selon la position actuelle jusqu\'à enregistrement.',
+    updateCycle: 'Cycle des coins',
+    updateHint: 'Des valeurs plus élevées réduisent les redraws et ralentissent la rotation.',
+    language: 'Langue',
+    languageHint: 'Par défaut selon la langue du téléphone ou de la montre jusqu\'à enregistrement.',
+    location: 'Emplacement',
+    closestCity: 'Ville la plus proche',
+    locationUnknown: 'Emplacement pas encore disponible',
+    seconds: 'secondes',
+    save: 'Enregistrer'
+  },
+  es: {
+    title: 'Ajustes de YES Watchface',
+    useInternet: 'Usar Internet (MET Norway) para salida/puesta',
+    useInternetHint: 'Si está activo, el teléfono obtiene horas de sol/luna por Internet y usa cálculos locales si hace falta.',
+    units: 'Unidades',
+    metric: 'Métrico (Celsius, km/h)',
+    imperial: 'Imperial (Fahrenheit, mph)',
+    unitsHint: 'Por defecto según la ubicación actual hasta guardar.',
+    updateCycle: 'Ciclo de esquinas',
+    updateHint: 'Valores más altos reducen redibujos y ralentizan la rotación.',
+    language: 'Idioma',
+    languageHint: 'Por defecto según el idioma del teléfono o reloj hasta guardar.',
+    location: 'Ubicación',
+    closestCity: 'Ciudad más cercana',
+    locationUnknown: 'Ubicación aún no disponible',
+    seconds: 'segundos',
+    save: 'Guardar'
+  },
+  pt: {
+    title: 'Definições YES Watchface',
+    useInternet: 'Usar Internet (MET Norway) para nascer/por',
+    useInternetHint: 'Se ativo, o telefone busca horários do sol/lua online e usa cálculo local se necessário.',
+    units: 'Unidades',
+    metric: 'Métrico (Celsius, km/h)',
+    imperial: 'Imperial (Fahrenheit, mph)',
+    unitsHint: 'Padrão pela localização atual até guardar.',
+    updateCycle: 'Ciclo dos cantos',
+    updateHint: 'Valores maiores reduzem redesenhos e tornam a rotação mais lenta.',
+    language: 'Idioma',
+    languageHint: 'Padrão pelo idioma do telefone ou relógio até guardar.',
+    location: 'Localização',
+    closestCity: 'Cidade mais próxima',
+    locationUnknown: 'Localização ainda indisponível',
+    seconds: 'segundos',
+    save: 'Guardar'
+  },
+  it: {
+    title: 'Impostazioni YES Watchface',
+    useInternet: 'Usa Internet (MET Norway) per alba/tramonto',
+    useInternetHint: 'Se attivo, il telefono scarica orari sole/luna online e usa il calcolo locale se serve.',
+    units: 'Unità',
+    metric: 'Metrico (Celsius, km/h)',
+    imperial: 'Imperiale (Fahrenheit, mph)',
+    unitsHint: 'Predefinito dalla posizione attuale finché non salvi.',
+    updateCycle: 'Ciclo angoli',
+    updateHint: 'Valori più alti riducono i redraw e rallentano la rotazione.',
+    language: 'Lingua',
+    languageHint: 'Predefinito dalla lingua di telefono o orologio finché non salvi.',
+    location: 'Posizione',
+    closestCity: 'Città più vicina',
+    locationUnknown: 'Posizione non ancora disponibile',
+    seconds: 'secondi',
+    save: 'Salva'
   }
-}
+};
 
-function sendHomeOverride() {
-  const home = readHomeOverrideFromStorage();
-  if (!home || !home.valid) return false;
-
-  const payload = {};
-  payload[KEYS.LAT_E6] = home.latE6;
-  payload[KEYS.LON_E6] = home.lonE6;
-  payload[KEYS.TZ_OFFSET_MIN] = home.tzOffsetMin;
-  payload[KEYS.LOC_UNIX] = Math.floor(Date.now() / 1000);
-  payload[KEYS.USE_INTERNET_FALLBACK] = readUseInternetFromStorage() ? 1 : 0;
-
-  sendQueued(payload, () => {
-    State.lastSentAtMs = Date.now();
-    State.lastLoc = { latE6: home.latE6, lonE6: home.lonE6, tzOffsetMin: home.tzOffsetMin };
-    const ymdInt = ymdIntForOffsetMinutes(home.tzOffsetMin);
-    State.lastLocSent = { latE6: home.latE6, lonE6: home.lonE6, tzOffsetMin: home.tzOffsetMin, ymd: ymdInt };
-    saveLastLocSent(State.lastLocSent);
-    State.lastAstroYmd = ymdInt;
-    // Defer astro send slightly to avoid back-to-back messages at startup.
-    setTimeout(() => {
-      sendAstroForCurrentLocation(home.latE6, home.lonE6, home.tzOffsetMin);
-      maybeSendTides(home.latE6, home.lonE6, true);
-      maybeSendWeather(home.latE6, home.lonE6, true);
-    }, 200);
-  });
-  return true;
+function configStrings() {
+  return CONFIG_I18N[currentLanguageCode()] || CONFIG_I18N.en;
 }
 
 function getUiModelFromStorage() {
   // Read stored values in pkjs context (localStorage is available here).
-  const homeStored = readHomeOverrideFromStorage();
   const useInternet = readUseInternetFromStorage();
+  const unitsMode = readUnitsModeFromStorage();
+  const uiUpdateIntervalSec = readUpdateIntervalSecFromStorage();
+  const language = readLanguageFromStorage();
+  const locationDisplay = getLocationDisplayForConfig();
 
-  const homeUi = homeStored && homeStored.valid ? {
-    valid: true,
-    lat: homeStored.latE6 / 1e6,
-    lon: homeStored.lonE6 / 1e6,
-    tzOffsetMin: homeStored.tzOffsetMin
-  } : { valid: false };
-
-  return { homeUi, useInternet };
+  return { useInternet, unitsMode, uiUpdateIntervalSec, language, locationDisplay };
 }
 
-function configHtml(homeUi, useInternet) {
+function configLanguageOptionsHtml() {
+  return Object.keys(LANGUAGE_IDS).map((code) => {
+    const label = LANGUAGE_LABELS[code] || code;
+    return `<option value="${code}">${label}</option>`;
+  }).join('\n      ');
+}
+
+function configHtml(useInternet, unitsMode, uiUpdateIntervalSec, language, locationDisplay) {
   // Inline config page.
   // IMPORTANT: localStorage is disabled for `data:` URLs in many browsers, so do NOT access it here.
   // We inject initial values from pkjs instead and return the user's changes via return_to/pebblejs://close.
+  const L = configStrings();
+  const languageCode = normalizeLanguageCode(language);
+  const locationText = escapeHtmlForConfig(locationDisplay || L.locationUnknown);
   return `
 <!doctype html>
 <html>
@@ -1321,40 +1576,55 @@ function configHtml(homeUi, useInternet) {
     body { font-family: -apple-system, system-ui, sans-serif; margin: 16px; }
     .row { margin: 12px 0; }
     label { display: block; font-weight: 600; margin-bottom: 6px; }
-    input { width: 100%; padding: 10px; font-size: 16px; box-sizing: border-box; }
+    input, select { width: 100%; padding: 10px; font-size: 16px; box-sizing: border-box; }
+    input[type="checkbox"] { width: auto; padding: 0; }
     button { width: 100%; padding: 12px; font-size: 16px; margin-top: 10px; }
     .hint { font-size: 12px; color: #555; }
+    .location-value { font-size: 15px; line-height: 1.35; }
   </style>
 </head>
 <body>
-  <h2>Home override (optional)</h2>
+  <h2>${L.title}</h2>
   <div class="row">
-    <label><input type="checkbox" id="homeEnabled"> Override Home location</label>
-    <div class="hint">Useful in the emulator/VPN. If disabled, Home uses your phone's current location.</div>
+    <label>${L.location}</label>
+    <div class="location-value">${locationText}</div>
   </div>
   <div class="row">
-    <label>Home Latitude (decimal degrees)</label>
-    <input id="homeLat" placeholder="e.g. 26.176807">
+    <label><input type="checkbox" id="useInternet"> ${L.useInternet}</label>
+    <div class="hint">${L.useInternetHint}</div>
   </div>
   <div class="row">
-    <label>Home Longitude (decimal degrees)</label>
-    <input id="homeLon" placeholder="e.g. -80.171041">
+    <label>${L.units}</label>
+    <select id="unitsMode">
+      <option value="metric">${L.metric}</option>
+      <option value="imperial">${L.imperial}</option>
+    </select>
+    <div class="hint">${L.unitsHint}</div>
   </div>
   <div class="row">
-    <label>Home UTC offset minutes</label>
-    <input id="homeTz" placeholder="e.g. -300 (EST), -240 (EDT)">
+    <label>${L.updateCycle}</label>
+    <select id="uiUpdateIntervalSec">
+      <option value="5">5 ${L.seconds}</option>
+      <option value="10">10 ${L.seconds}</option>
+      <option value="30">30 ${L.seconds}</option>
+      <option value="60">60 ${L.seconds}</option>
+    </select>
+    <div class="hint">${L.updateHint}</div>
   </div>
-  <button id="homeUseGps">Use my current GPS as Home</button>
-
   <div class="row">
-    <label><input type="checkbox" id="useInternet"> Use Internet (MET Norway) for rise/set</label>
-    <div class="hint">If enabled, the phone will fetch sun/moon rise/set from the Internet when possible, and fall back to local calculations if needed.</div>
+    <label>${L.language}</label>
+    <select id="language">
+      ${configLanguageOptionsHtml()}
+    </select>
+    <div class="hint">${L.languageHint}</div>
   </div>
-  <button id="save">Save</button>
+  <button id="save">${L.save}</button>
 
   <script>
-    const INITIAL_HOME = ${JSON.stringify(homeUi || { valid: false })};
     const INITIAL_USE_INTERNET = ${JSON.stringify(!!useInternet)};
+    const INITIAL_UNITS_MODE = ${JSON.stringify(normalizeUnitsMode(unitsMode) || 'metric')};
+    const INITIAL_UI_UPDATE_INTERVAL_SEC = ${JSON.stringify(normalizeUpdateIntervalSec(uiUpdateIntervalSec))};
+    const INITIAL_LANGUAGE = ${JSON.stringify(languageCode)};
 
     function closeWith(payload) {
       const encoded = encodeURIComponent(JSON.stringify(payload));
@@ -1374,54 +1644,27 @@ function configHtml(homeUi, useInternet) {
 
     function load() {
       try {
-        // Home
-        document.getElementById('homeEnabled').checked = !!INITIAL_HOME.valid;
-        if (typeof INITIAL_HOME.lat === 'number') document.getElementById('homeLat').value = String(INITIAL_HOME.lat);
-        if (typeof INITIAL_HOME.lon === 'number') document.getElementById('homeLon').value = String(INITIAL_HOME.lon);
-        if (typeof INITIAL_HOME.tzOffsetMin === 'number') document.getElementById('homeTz').value = String(INITIAL_HOME.tzOffsetMin);
         document.getElementById('useInternet').checked = !!INITIAL_USE_INTERNET;
+        document.getElementById('unitsMode').value = INITIAL_UNITS_MODE;
+        document.getElementById('uiUpdateIntervalSec').value = String(INITIAL_UI_UPDATE_INTERVAL_SEC);
+        document.getElementById('language').value = INITIAL_LANGUAGE;
       } catch (e) {}
     }
 
     function save() {
-      // Home
-      const homeEnabled = document.getElementById('homeEnabled').checked;
-      if (!homeEnabled) {
-        // no-op
-      } else {
-        const hlat = parseFloat(document.getElementById('homeLat').value);
-        const hlon = parseFloat(document.getElementById('homeLon').value);
-        const htz = parseInt(document.getElementById('homeTz').value, 10);
-        if (!isFinite(hlat) || !isFinite(hlon) || !isFinite(htz)) {
-          alert('Please enter valid Home latitude, longitude, and UTC offset minutes.');
-          return;
-        }
-        // no-op
-      }
-
       const useInternet = document.getElementById('useInternet').checked;
+      const unitsMode = document.getElementById('unitsMode').value === 'imperial' ? 'imperial' : 'metric';
+      const uiUpdateIntervalSec = parseInt(document.getElementById('uiUpdateIntervalSec').value, 10);
+      const language = document.getElementById('language').value;
       closeWith({
         useInternet: !!useInternet,
-        home: homeEnabled ? { valid: true, lat: parseFloat(document.getElementById('homeLat').value), lon: parseFloat(document.getElementById('homeLon').value), tzOffsetMin: parseInt(document.getElementById('homeTz').value, 10) } : { valid: false }
+        unitsMode: unitsMode,
+        uiUpdateIntervalSec: uiUpdateIntervalSec,
+        language: language
       });
     }
 
-    function homeUseGps() {
-      if (!navigator.geolocation) { alert('Geolocation not available'); return; }
-      navigator.geolocation.getCurrentPosition(
-        function(pos) {
-          document.getElementById('homeEnabled').checked = true;
-          document.getElementById('homeLat').value = String(pos.coords.latitude);
-          document.getElementById('homeLon').value = String(pos.coords.longitude);
-          document.getElementById('homeTz').value = String(-new Date().getTimezoneOffset());
-        },
-        function() { alert('Failed to get GPS'); },
-        { enableHighAccuracy: false, timeout: 15000, maximumAge: 600000 }
-      );
-    }
-
     document.getElementById('save').addEventListener('click', save);
-    document.getElementById('homeUseGps').addEventListener('click', homeUseGps);
     load();
   </script>
 </body>
@@ -1434,14 +1677,15 @@ Pebble.addEventListener('ready', () => {
   if (State.lastLocSent && typeof State.lastLocSent.ymd === 'number') {
     State.lastAstroYmd = State.lastLocSent.ymd | 0;
   }
-  // Prefer Home override if set; otherwise request GPS.
-  if (!sendHomeOverride()) requestLocation(true);
+  requestLocation(true);
+  sendLanguage();
   sendUseInternetFlag();
+  sendUiUpdateInterval();
   setInterval(maybeRefreshLocation, 10 * 60 * 1000);
 
   // Re-send astro data periodically (handles date rollovers even if GPS doesn't change)
   setInterval(() => {
-    if (!sendHomeOverride()) requestLocation(false);
+    requestLocation(false);
     maybeSendAstroForDayRollover();
     if (State.lastLoc) {
       maybeSendTides(State.lastLoc.latE6, State.lastLoc.lonE6, false);
@@ -1453,13 +1697,19 @@ Pebble.addEventListener('ready', () => {
 Pebble.addEventListener('appmessage', (e) => {
   const dict = e && e.payload ? e.payload : {};
   if (dict[KEYS.REQUEST_LOC]) {
-    if (!sendHomeOverride()) requestLocation(true);
+    requestLocation(true);
   }
 });
 
 Pebble.addEventListener('showConfiguration', () => {
+  const loc = currentLocationRecord();
+  if (loc) maybeUpdateLocationLabel(loc.latE6, loc.lonE6);
+  requestLocation(false);
   const ui = getUiModelFromStorage();
-  const url = 'data:text/html;charset=utf-8,' + encodeURIComponent(configHtml(ui.homeUi, ui.useInternet));
+  sendLanguage();
+  const url = 'data:text/html;charset=utf-8,' + encodeURIComponent(
+    configHtml(ui.useInternet, ui.unitsMode, ui.uiUpdateIntervalSec, ui.language, ui.locationDisplay)
+  );
   Pebble.openURL(url);
 });
 
@@ -1467,22 +1717,31 @@ Pebble.addEventListener('webviewclosed', (e) => {
   if (!e || !e.response) return;
   try {
     const payload = JSON.parse(decodeURIComponent(e.response));
-    if (payload && payload.home) {
-      if (!payload.home.valid) {
-        localStorage.setItem('home', JSON.stringify({ valid: false }));
-      } else {
-        const latE6 = Math.round(payload.home.lat * 1e6);
-        const lonE6 = Math.round(payload.home.lon * 1e6);
-        const obj = { valid: true, latE6: latE6, lonE6: lonE6, tzOffsetMin: payload.home.tzOffsetMin | 0 };
-        localStorage.setItem('home', JSON.stringify(obj));
-      }
-      // Immediately send HOME override (or resume GPS if disabled)
-      if (!sendHomeOverride()) requestLocation(false);
-    }
     if (payload && typeof payload.useInternet === 'boolean') {
       localStorage.setItem('useInternet', payload.useInternet ? '1' : '0');
       sendUseInternetFlag();
       if (State.lastLoc) sendAstroForCurrentLocation(State.lastLoc.latE6, State.lastLoc.lonE6, State.lastLoc.tzOffsetMin);
+    }
+    if (payload && normalizeUnitsMode(payload.unitsMode)) {
+      const prevUnitsMode = readUnitsModeFromStorage();
+      localStorage.setItem('unitsMode', payload.unitsMode);
+      if (State.lastLoc && prevUnitsMode !== payload.unitsMode) {
+        sendAltitudeUnitForLocation(State.lastLoc.latE6, State.lastLoc.lonE6);
+        maybeSendTides(State.lastLoc.latE6, State.lastLoc.lonE6, true);
+        maybeSendWeather(State.lastLoc.latE6, State.lastLoc.lonE6, true);
+      }
+    }
+    if (payload && typeof payload.uiUpdateIntervalSec !== 'undefined') {
+      localStorage.setItem('uiUpdateIntervalSec', String(normalizeUpdateIntervalSec(payload.uiUpdateIntervalSec)));
+      sendUiUpdateInterval();
+    }
+    if (payload && normalizeLanguageCode(payload.language)) {
+      const prevLanguage = readLanguageFromStorage();
+      const nextLanguage = normalizeLanguageCode(payload.language);
+      localStorage.setItem('language', nextLanguage);
+      if (prevLanguage !== nextLanguage) {
+        sendLanguage();
+      }
     }
   } catch (err) {
     // ignore invalid responses
