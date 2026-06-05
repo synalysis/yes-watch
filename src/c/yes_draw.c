@@ -77,20 +77,6 @@ static void format_deg2_from_e6(char *out, size_t out_sz, int32_t e6) {
 }
 #endif
 
-static void format_clock_time(char *out, size_t out_sz, const struct tm *tm_p, bool is24) {
-  if (!tm_p) {
-    snprintf(out, out_sz, "--:--");
-    return;
-  }
-
-  int hour = tm_p->tm_hour;
-  if (!is24) {
-    hour %= 12;
-    if (hour == 0) hour = 12;
-  }
-  snprintf(out, out_sz, "%d:%02d", hour, tm_p->tm_min);
-}
-
 static void fill_radial_wedge(GContext *ctx, GRect bounds, uint16_t inset,
                               int32_t start_angle, int32_t end_angle, GColor color) {
   const GRect disk_rect = GRect(bounds.origin.x + inset,
@@ -768,30 +754,15 @@ static void draw_top_right_date(const CornerCtx *c) {
   year_buf[0] = '\0';
   weekday_buf[0] = '\0';
 
-  if (c->loc && c->loc->valid) {
-    time_t now_utc = time(NULL);
-    time_t shifted = now_utc + (time_t)c->loc->tz_offset_min * 60;
-    struct tm *tm_p = gmtime(&shifted);
-    if (tm_p) {
-      strftime(date_buf, sizeof(date_buf), "%b %e", tm_p);
-      strftime(year_buf, sizeof(year_buf), "%Y", tm_p);
-      if (tm_p->tm_wday >= 0 && tm_p->tm_wday < 7) {
-        strcpy(weekday_buf, yes_i18n_weekday_short(tm_p->tm_wday));
-      }
+  struct tm tm_loc;
+  if (yes_local_tm_now(c->loc, &tm_loc, NULL)) {
+    strftime(date_buf, sizeof(date_buf), "%b %e", &tm_loc);
+    strftime(year_buf, sizeof(year_buf), "%Y", &tm_loc);
+    if (tm_loc.tm_wday >= 0 && tm_loc.tm_wday < 7) {
+      strcpy(weekday_buf, yes_i18n_weekday_short(tm_loc.tm_wday));
     }
-  }
-  if (!date_buf[0]) {
-    time_t now = time(NULL);
-    struct tm *tm_p = localtime(&now);
-    if (tm_p) {
-      strftime(date_buf, sizeof(date_buf), "%b %e", tm_p);
-      strftime(year_buf, sizeof(year_buf), "%Y", tm_p);
-      if (tm_p->tm_wday >= 0 && tm_p->tm_wday < 7) {
-        strcpy(weekday_buf, yes_i18n_weekday_short(tm_p->tm_wday));
-      }
-    } else {
-      strcpy(date_buf, "--");
-    }
+  } else {
+    strcpy(date_buf, "--");
   }
 
   const int cycle_sec = (c->ui_update_interval_sec == 10 || c->ui_update_interval_sec == 30 || c->ui_update_interval_sec == 60)
@@ -852,18 +823,9 @@ static bool br_avail_age(const CornerCtx *c) { return c->have_phase; }
 
 static int br_compute_now_min(const CornerCtx *c) {
   int now_min = -1;
-  if (c->loc && c->loc->valid) {
-    time_t now_utc = time(NULL);
-    time_t shifted = now_utc + (time_t)c->loc->tz_offset_min * 60;
-    struct tm *tm_p = gmtime(&shifted);
-    if (tm_p) now_min = tm_p->tm_hour * 60 + tm_p->tm_min;
-  }
-  if (now_min < 0) {
-    time_t now = time(NULL);
-    struct tm *tm_p = localtime(&now);
-    if (tm_p) now_min = tm_p->tm_hour * 60 + tm_p->tm_min;
-  }
-  return now_min;
+  struct tm tm_loc;
+  if (yes_local_tm_now(c->loc, &tm_loc, &now_min)) return now_min;
+  return -1;
 }
 
 static bool minute_in_circular_interval(int minute, int start, int end) {
@@ -1296,18 +1258,11 @@ void yes_draw_face(Layer *layer, GContext *ctx,
   if (debug) {
     char buf0[32], buf1[32], buf2[32], buf3[32], buf4[32], buf5[32];
 
-    char time_buf[6];
-    if (loc && loc->valid) {
-      time_t now_utc = time(NULL);
-      time_t shifted = now_utc + (time_t)loc->tz_offset_min * 60;
-      struct tm *tm_p = gmtime(&shifted);
-      format_clock_time(time_buf, sizeof(time_buf), tm_p, clock_is_24h_style());
-    } else {
-      strcpy(time_buf, "--:--");
-    }
+    char time_buf[12];
+    clock_copy_time_string(time_buf, sizeof(time_buf));
 
     if (loc && loc->valid) {
-      const int off = (int)loc->tz_offset_min;
+      const int off = (int)yes_tz_offset_min(loc);
       const int sign = (off < 0) ? -1 : 1;
       const int aoff = off * sign;
       const int hh = aoff / 60;
@@ -1574,13 +1529,7 @@ void yes_draw_face(Layer *layer, GContext *ctx,
 
   struct tm tm_loc;
   int minutes = 0;
-  if (loc && loc->valid) {
-    if (!get_location_local_tm(loc, &tm_loc, &minutes)) minutes = 0;
-  } else {
-    time_t now_utc = time(NULL);
-    struct tm *local_tm = localtime(&now_utc);
-    minutes = local_tm ? (local_tm->tm_hour * 60 + local_tm->tm_min) : 0;
-  }
+  if (!yes_local_tm_now(loc, &tm_loc, &minutes)) minutes = 0;
 
   const int32_t hand_angle = angle_from_local_minutes_24h(minutes);
   const int16_t solar_r = (int16_t)(face_r - (int16_t)solar_inset - scale_px(2, face_r));
@@ -1662,25 +1611,8 @@ void yes_draw_face(Layer *layer, GContext *ctx,
     graphics_fill_circle(ctx, c, scale_px(4, face_r));
   }
 
-  char time_buf[6];
-  char ampm_buf[3];
-  ampm_buf[0] = '\0';
-  if (loc && loc->valid) {
-    time_t now_utc = time(NULL);
-    time_t shifted = now_utc + (time_t)loc->tz_offset_min * 60;
-    struct tm *tm_p = gmtime(&shifted);
-    if (tm_p) {
-      const bool is24 = clock_is_24h_style();
-      format_clock_time(time_buf, sizeof(time_buf), tm_p, is24);
-      if (!is24) {
-        strftime(ampm_buf, sizeof(ampm_buf), "%p", tm_p);
-      }
-    } else {
-      strcpy(time_buf, "--:--");
-    }
-  } else {
-    strcpy(time_buf, "--:--");
-  }
+  char time_buf[12];
+  clock_copy_time_string(time_buf, sizeof(time_buf));
 
   // Digital time (top half between center and moon ring)
   {
@@ -1699,26 +1631,6 @@ void yes_draw_face(Layer *layer, GContext *ctx,
     graphics_draw_text(ctx, time_buf, f_time,
                        time_rect,
                        GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
-
-    // Optional AM/PM label (only in 12h mode)
-    if (ampm_buf[0]) {
-      const GFont f_ampm = (min_dim >= 200) ? fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD)
-                                            : fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD);
-      const int16_t pad = scale_px(4, face_r);
-      const GSize time_sz = graphics_text_layout_get_content_size(
-        time_buf, f_time, GRect(0, 0, bounds.size.w, time_h),
-        GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter
-      );
-
-      int16_t ampm_x = (int16_t)((bounds.size.w - time_sz.w) / 2 + time_sz.w + pad);
-      if (ampm_x < 0) ampm_x = 0;
-      const int16_t ampm_w = scale_px(28, face_r);
-      if (ampm_x + ampm_w > bounds.size.w) ampm_x = (int16_t)(bounds.size.w - ampm_w);
-
-      graphics_draw_text(ctx, ampm_buf, f_ampm,
-                         GRect(ampm_x, time_rect.origin.y, ampm_w, time_rect.size.h),
-                         GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
-    }
   }
 
   // Corner: top-left is now drawn in the overlay layer (`yes_draw_corners`) so that

@@ -38,15 +38,45 @@ static int32_t clamp_i32(int32_t v, int32_t lo, int32_t hi) {
   return v;
 }
 
+int32_t yes_tz_offset_min(const GeoLoc *loc) {
+  if (clock_is_timezone_set()) {
+    const time_t now = time(NULL);
+    struct tm *tm_p = localtime(&now);
+    if (tm_p) return (int32_t)(tm_p->tm_gmtoff / 60);
+  }
+  if (loc && loc->valid) return loc->tz_offset_min;
+  return 0;
+}
+
+bool yes_local_tm_now(const GeoLoc *loc, struct tm *out_tm, int *out_minutes_since_midnight) {
+  if (!out_tm) return false;
+
+  const time_t now = time(NULL);
+  struct tm *tm_p = NULL;
+  if (clock_is_timezone_set()) {
+    tm_p = localtime(&now);
+  } else if (loc && loc->valid) {
+    const time_t shifted = now + (time_t)loc->tz_offset_min * 60;
+    tm_p = gmtime(&shifted);
+  } else {
+    tm_p = localtime(&now);
+  }
+  if (!tm_p) return false;
+
+  *out_tm = *tm_p;
+  if (out_minutes_since_midnight) {
+    *out_minutes_since_midnight = tm_p->tm_hour * 60 + tm_p->tm_min;
+  }
+  return true;
+}
+
 int ymd_for_loc_now(const GeoLoc *loc, int *out_y, int *out_m, int *out_d) {
   if (!loc || !loc->valid) return 0;
-  const time_t now_utc = time(NULL);
-  const time_t shifted = now_utc + (time_t)loc->tz_offset_min * 60;
-  struct tm *tm_p = gmtime(&shifted);
-  if (!tm_p) return 0;
-  const int y = tm_p->tm_year + 1900;
-  const int m = tm_p->tm_mon + 1;
-  const int d = tm_p->tm_mday;
+  struct tm tm_loc;
+  if (!yes_local_tm_now(loc, &tm_loc, NULL)) return 0;
+  const int y = tm_loc.tm_year + 1900;
+  const int m = tm_loc.tm_mon + 1;
+  const int d = tm_loc.tm_mday;
   if (out_y) *out_y = y;
   if (out_m) *out_m = m;
   if (out_d) *out_d = d;
@@ -55,17 +85,7 @@ int ymd_for_loc_now(const GeoLoc *loc, int *out_y, int *out_m, int *out_d) {
 
 bool get_location_local_tm(const GeoLoc *loc, struct tm *out_tm, int *out_minutes_since_midnight) {
   if (!loc || !loc->valid) return false;
-
-  time_t now_utc = time(NULL);
-  time_t shifted = now_utc + (time_t)loc->tz_offset_min * 60;
-  struct tm *tm_loc = gmtime(&shifted);
-  if (!tm_loc) return false;
-
-  *out_tm = *tm_loc;
-  if (out_minutes_since_midnight) {
-    *out_minutes_since_midnight = tm_loc->tm_hour * 60 + tm_loc->tm_min;
-  }
-  return true;
+  return yes_local_tm_now(loc, out_tm, out_minutes_since_midnight);
 }
 
 // Compute sin(altitude) of sun at a given minute using NOAA "equation of time" approximation

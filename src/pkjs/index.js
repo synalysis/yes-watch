@@ -1352,11 +1352,14 @@ function sendLocation(position, force) {
   // to a longitude-based rough timezone offset.
   let tzOffsetMin = -new Date().getTimezoneOffset();
   const tzGuessMin = Math.round(coords.longitude / 15) * 60; // rough; ignores political boundaries/DST
+  // Near the prime meridian, lon/15 rounds to 0 and is useless — never override a real phone TZ
+  // (e.g. Berrac, France at 0.55°E must stay on Europe/Paris, not UTC).
+  const lonGuessReliable = Math.abs(tzGuessMin) >= 60;
   const mismatch =
-    (tzOffsetMin === 0 && Math.abs(tzGuessMin) >= 60) ||
-    (tzGuessMin === 0 && Math.abs(tzOffsetMin) >= 60) ||
-    (Math.sign(tzOffsetMin) !== Math.sign(tzGuessMin) && Math.abs(tzOffsetMin - tzGuessMin) >= 120) ||
-    (Math.abs(tzOffsetMin - tzGuessMin) >= 360); // >= 6 hours off is definitely wrong
+    (tzOffsetMin === 0 && lonGuessReliable) ||
+    (lonGuessReliable && Math.sign(tzOffsetMin) !== 0 && Math.sign(tzGuessMin) !== 0 &&
+      Math.sign(tzOffsetMin) !== Math.sign(tzGuessMin) && Math.abs(tzOffsetMin - tzGuessMin) >= 120) ||
+    (lonGuessReliable && Math.abs(tzOffsetMin - tzGuessMin) >= 360);
   if (mismatch) {
     log('[pkjs] TZ mismatch; using lon-based tz', { tzOffsetMin: tzOffsetMin, tzGuessMin: tzGuessMin, lat: coords.latitude, lon: coords.longitude });
     tzOffsetMin = tzGuessMin;

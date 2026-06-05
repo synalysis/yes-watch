@@ -247,7 +247,7 @@ static void fallback_calc_cb(void *context) {
     if (s_home_ymd) {
       const double lat = (double)s_home.lat_e6 / 1e6;
       const double lon = (double)s_home.lon_e6 / 1e6;
-      s_sun_home = calc_sunrise_sunset_local(y, m, d, lat, lon, s_home.tz_offset_min);
+      s_sun_home = calc_sunrise_sunset_local(y, m, d, lat, lon, yes_tz_offset_min(&s_home));
     }
     // Persist only if we already have moon from cache/phone; otherwise keep previous moon values.
     if (s_home_ymd && s_moon_home.valid) {
