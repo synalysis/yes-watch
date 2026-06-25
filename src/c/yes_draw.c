@@ -185,6 +185,7 @@ static void draw_outer_scale(GContext *ctx, GRect bounds, uint16_t moon_inset, u
     const int m = i * 30;
     if ((m % 60) == 0) continue;
     if ((m % 120) == 0) continue;
+    if (face_r > 90 && (i & 1)) continue;
 
     const int32_t a = angle_from_local_minutes_24h(m);
     const int16_t x1 = (int16_t)(c.x + (int32_t)sin_lookup(a) * r_short_start / TRIG_MAX_RATIO);
@@ -246,7 +247,49 @@ static int16_t isqrt16(int16_t n) {
   return x;
 }
 
+#ifndef PBL_ROUND
+static int s_draw_min_dim;
+#endif
+
+static void draw_moon_fast(GContext *ctx, GPoint center, int radius, double phase) {
+  const double eps = 0.015;
+  if (phase < 0) phase = 0;
+  if (phase > 1) phase = 1;
+
+  if (phase < eps) {
+    graphics_context_set_fill_color(ctx, GColorBlack);
+    graphics_fill_circle(ctx, center, radius);
+    graphics_context_set_stroke_color(ctx, GColorWhite);
+    graphics_draw_circle(ctx, center, radius);
+    return;
+  }
+  if (phase > 1.0 - eps || fabs(phase - 0.5) < eps) {
+    graphics_context_set_fill_color(ctx, GColorWhite);
+    graphics_fill_circle(ctx, center, radius);
+    graphics_context_set_stroke_color(ctx, GColorWhite);
+    graphics_draw_circle(ctx, center, radius);
+    return;
+  }
+
+  graphics_context_set_fill_color(ctx, GColorWhite);
+  graphics_fill_circle(ctx, center, radius);
+
+  const bool waxing = (phase < 0.5);
+  const int16_t offset = (int16_t)lround(2.0 * (double)radius * fabs(2.0 * (phase - 0.5)));
+  const GPoint shadow_c = GPoint((int16_t)(center.x + (waxing ? -offset : offset)), center.y);
+  graphics_context_set_fill_color(ctx, GColorBlack);
+  graphics_fill_circle(ctx, shadow_c, radius);
+  graphics_context_set_stroke_color(ctx, GColorWhite);
+  graphics_draw_circle(ctx, center, radius);
+}
+
 static void draw_moon(GContext *ctx, GPoint center, int radius, double phase) {
+#ifndef PBL_ROUND
+  if (s_draw_min_dim >= 200) {
+    draw_moon_fast(ctx, center, radius, phase);
+    return;
+  }
+#endif
   // Snap near endpoints so "full" and "new" look clean and don't show a stray terminator.
   // Also, draw the terminator using scanlines so the shadow never paints outside the moon disk.
   const double eps = 0.015; // ~0.44 days
@@ -1051,19 +1094,45 @@ static void tl_draw_bt(const CornerCtx *c) {
                      GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
 }
 
+static bool tl_steps_health_usable(void) {
+#ifndef PBL_ROUND
+  // Health queries can stall the UI on Pebble Time 2; steps are optional.
+  if (s_draw_min_dim >= 200) return false;
+#endif
+  static int8_t s_health_steps_state = 0; // 0 unknown, 1 available, -1 unavailable
+  static time_t s_health_checked_at = 0;
+  const time_t now = time(NULL);
+
+  if (s_health_steps_state == -1 && (now - s_health_checked_at) < 300) {
+    return false;
+  }
+  if (s_health_steps_state != 1 &&
+      (s_health_checked_at == 0 || (now - s_health_checked_at) >= 60)) {
+    const time_t t0 = time_start_of_today();
+    const HealthServiceAccessibilityMask m =
+      health_service_metric_accessible(HealthMetricStepCount, t0, now);
+    s_health_checked_at = now;
+    if ((m & HealthServiceAccessibilityMaskAvailable) != 0) {
+      s_health_steps_state = 1;
+    } else if ((m & (HealthServiceAccessibilityMaskNotSupported |
+                     HealthServiceAccessibilityMaskNoPermission)) != 0) {
+      s_health_steps_state = -1;
+    } else {
+      s_health_steps_state = 0;
+    }
+  }
+  return s_health_steps_state == 1;
+}
+
 static int tl_steps_count_cached(void) {
   // Health calls can be surprisingly expensive on some platforms; cache at most once per minute.
   static int s_steps_cached = -1;
   static time_t s_steps_cached_at = 0;
   const time_t now = time(NULL);
+  if (!tl_steps_health_usable()) return -1;
   if (s_steps_cached_at == 0 || (now - s_steps_cached_at) >= 60) {
-    int steps = -1;
-    const time_t t0 = time_start_of_today();
-    const HealthServiceAccessibilityMask m = health_service_metric_accessible(HealthMetricStepCount, t0, now);
-    if ((m & HealthServiceAccessibilityMaskAvailable) != 0) {
-      steps = (int)health_service_sum_today(HealthMetricStepCount);
-    }
-    s_steps_cached = steps;
+    const int steps = (int)health_service_sum_today(HealthMetricStepCount);
+    s_steps_cached = (steps > 0) ? steps : -1;
     s_steps_cached_at = now;
   }
   return s_steps_cached;
@@ -1249,6 +1318,9 @@ void yes_draw_face(Layer *layer, GContext *ctx,
   const GRect bounds = layer_get_bounds(layer);
   const GPoint c = grect_center_point(&bounds);
   const int min_dim = (int)MIN(bounds.size.w, bounds.size.h);
+#ifndef PBL_ROUND
+  s_draw_min_dim = min_dim;
+#endif
   const int16_t face_r = (int16_t)(min_dim / 2);
 
   graphics_context_set_fill_color(ctx, GColorBlack);
@@ -1386,7 +1458,7 @@ void yes_draw_face(Layer *layer, GContext *ctx,
 #endif
 
   // Loading/progress screen: avoid flashing obviously wrong times while data is still arriving.
-  if (!(have_loc && have_sun && have_moon)) {
+  if (!(have_loc && have_sun)) {
     graphics_context_set_text_color(ctx, GColorWhite);
     const bool big = (min_dim >= 200);
     const GFont f_title = big ? fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD)
@@ -1407,16 +1479,15 @@ void yes_draw_face(Layer *layer, GContext *ctx,
     const char *msg = yes_i18n_text(YES_TEXT_WAITING_DATA);
     if (!have_loc) msg = yes_i18n_text(YES_TEXT_GETTING_LOCATION);
     else if (!have_sun) msg = yes_i18n_text(YES_TEXT_COMPUTING_SUN);
-    else if (!have_moon) msg = yes_i18n_text(YES_TEXT_WAITING_MOON);
 
     graphics_draw_text(ctx, msg, f_body,
                        GRect(0, msg_y, bounds.size.w, scale_px(26, face_r)),
                        GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
 
-    // Progress: 3 steps (loc, sun, moon)
-    int done = (have_loc ? 1 : 0) + (have_sun ? 1 : 0) + (have_moon ? 1 : 0);
+    // Progress: 2 steps (loc, sun)
+    int done = (have_loc ? 1 : 0) + (have_sun ? 1 : 0);
     char prog[16];
-    snprintf(prog, sizeof(prog), "%d/3", done);
+    snprintf(prog, sizeof(prog), "%d/2", done);
     const int16_t prog_h = scale_px(18, face_r);
     graphics_draw_text(ctx, prog, f_prog,
                        GRect(0, prog_y, bounds.size.w, prog_h),
@@ -1684,10 +1755,13 @@ void yes_draw_corners(Layer *layer, GContext *ctx,
   (void)layer;
   // Mirror the old behavior: no corners on debug or loading screen.
   if (debug) return;
-  if (!(have_loc && have_sun && have_moon)) return;
+  if (!(have_loc && have_sun)) return;
 
   const GRect bounds = layer_get_bounds(layer);
   const int min_dim = (int)MIN(bounds.size.w, bounds.size.h);
+#ifndef PBL_ROUND
+  s_draw_min_dim = min_dim;
+#endif
   const int16_t face_r = (int16_t)(min_dim / 2);
   const int16_t corner_pad = scale_px(6, face_r);
 

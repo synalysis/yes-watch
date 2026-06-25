@@ -20,9 +20,41 @@ static Layer *s_canvas_layer;
 static Layer *s_corner_layer;
 #endif
 static AppTimer *s_startup_timer;
+static AppTimer *s_redraw_timer;
+static bool s_pending_canvas_redraw;
+static bool s_pending_corner_redraw;
 #if ENABLE_DEBUG_SCREEN
 static bool s_debug;
 #endif
+
+#define FALLBACK_INITIAL_MS 5000
+
+static void redraw_timer_cb(void *context);
+
+static void schedule_redraw(bool canvas, bool corner) {
+  if (canvas) s_pending_canvas_redraw = true;
+#ifndef PBL_ROUND
+  if (corner) s_pending_corner_redraw = true;
+#endif
+  if (!s_redraw_timer) {
+    s_redraw_timer = app_timer_register(100, redraw_timer_cb, NULL);
+  }
+}
+
+static void redraw_timer_cb(void *context) {
+  (void)context;
+  s_redraw_timer = NULL;
+  if (s_pending_canvas_redraw && s_canvas_layer) {
+    layer_mark_dirty(s_canvas_layer);
+  }
+#ifndef PBL_ROUND
+  if (s_pending_corner_redraw && s_corner_layer) {
+    layer_mark_dirty(s_corner_layer);
+  }
+#endif
+  s_pending_canvas_redraw = false;
+  s_pending_corner_redraw = false;
+}
 
 // --- Watch-side fallback computations ---
 // This is now libm-free (uses Pebble fixed-point trig in yes_astro.c), so we can keep
@@ -147,6 +179,10 @@ typedef enum {
   CALC_PHASE_HOME_SUN,
 } CalcPhase;
 static CalcPhase s_calc_phase = CALC_PHASE_NONE;
+static uint8_t s_fallback_fail_count;
+static uint32_t s_fallback_delay_ms = FALLBACK_INITIAL_MS;
+
+#define FALLBACK_MAX_FAILS 6
 
 // Note: we no longer calculate sunrise/moonrise on-watch (too expensive on emulator/slow paths).
 // Phone-side JS computes and sends event times; the watch only renders.
@@ -220,17 +256,37 @@ static void persist_save_events_for_home(void) {
 
 static bool needs_fallback_for_home(void) {
   if (!s_home.valid) return false;
+#ifndef PBL_ROUND
+  // Phone computes sun times when connected; on-watch libm calc is expensive.
+  if (bluetooth_connection_service_peek()) return false;
+#endif
   const int ymd = ymd_for_loc_now(&s_home, NULL, NULL, NULL);
   if (ymd == 0) return false;
   if (s_home_ymd != ymd) return true;
-  return !s_sun_home.valid;
+  return !yes_sun_times_sane(&s_sun_home);
+}
+
+static void reset_fallback_backoff(void) {
+  s_fallback_fail_count = 0;
+  s_fallback_delay_ms = FALLBACK_INITIAL_MS;
 }
 
 static void schedule_fallback_calc_if_needed(void);
 
+static uint32_t fallback_backoff_ms(void) {
+  static const uint32_t delays_ms[] = { 5000, 10000, 20000, 30000, 60000, 60000 };
+  const int idx = (int)s_fallback_fail_count;
+  if (idx <= 0) return delays_ms[0];
+  if (idx >= (int)(sizeof(delays_ms) / sizeof(delays_ms[0]))) {
+    return delays_ms[(sizeof(delays_ms) / sizeof(delays_ms[0])) - 1];
+  }
+  return delays_ms[idx];
+}
+
 static void fallback_calc_cb(void *context) {
   (void)context;
   s_fallback_calc_timer = NULL;
+  bool succeeded = false;
 
   // Determine next needed phase if we're not already mid-run.
   if (s_calc_phase == CALC_PHASE_NONE) {
@@ -243,37 +299,45 @@ static void fallback_calc_cb(void *context) {
 
   if (s_calc_phase == CALC_PHASE_HOME_SUN) {
     int y=0,m=0,d=0;
-    s_home_ymd = ymd_for_loc_now(&s_home, &y, &m, &d);
-    if (s_home_ymd) {
+    const int ymd = ymd_for_loc_now(&s_home, &y, &m, &d);
+    if (ymd) {
       const double lat = (double)s_home.lat_e6 / 1e6;
       const double lon = (double)s_home.lon_e6 / 1e6;
       s_sun_home = calc_sunrise_sunset_local(y, m, d, lat, lon, yes_tz_offset_min(&s_home));
-    }
-    // Persist only if we already have moon from cache/phone; otherwise keep previous moon values.
-    if (s_home_ymd && s_moon_home.valid) {
-      persist_save_events_for_home();
-    } else if (s_home_ymd) {
-      // Still stamp the day so we don't recompute sun repeatedly; moon will remain stale until phone updates.
-      persist_write_int(PERSIST_HOME_YMD, s_home_ymd);
-      persist_write_int(PERSIST_HOME_SUN_STATE, sun_state_from_struct(&s_sun_home));
-      persist_write_int(PERSIST_HOME_SUNRISE_MIN, s_sun_home.sunrise_min);
-      persist_write_int(PERSIST_HOME_SUNSET_MIN, s_sun_home.sunset_min);
+      if (yes_sun_times_sane(&s_sun_home)) {
+        s_home_ymd = ymd;
+        succeeded = true;
+        if (s_moon_home.valid) {
+          persist_save_events_for_home();
+        } else {
+          persist_write_int(PERSIST_HOME_YMD, s_home_ymd);
+          persist_write_int(PERSIST_HOME_SUN_STATE, sun_state_from_struct(&s_sun_home));
+          persist_write_int(PERSIST_HOME_SUNRISE_MIN, s_sun_home.sunrise_min);
+          persist_write_int(PERSIST_HOME_SUNSET_MIN, s_sun_home.sunset_min);
+        }
+      }
     }
     s_calc_phase = CALC_PHASE_NONE;
   }
 
-  if (s_canvas_layer) layer_mark_dirty(s_canvas_layer);
+  if (succeeded) {
+    reset_fallback_backoff();
+    schedule_redraw(true, true);
+  } else if (needs_fallback_for_home()) {
+    s_fallback_fail_count++;
+    s_fallback_delay_ms = fallback_backoff_ms();
+  }
 
-  // Continue next phase (slice via timer to avoid blocking)
   schedule_fallback_calc_if_needed();
 }
 
 static void schedule_fallback_calc_if_needed(void) {
   if (s_fallback_calc_timer) return;
-  // If there is work queued or needed, run soon.
-  if (s_calc_phase != CALC_PHASE_NONE || needs_fallback_for_home()) {
-    s_fallback_calc_timer = app_timer_register(100, fallback_calc_cb, NULL);
+  if (s_calc_phase == CALC_PHASE_NONE) {
+    if (!needs_fallback_for_home()) return;
+    if (s_fallback_fail_count >= FALLBACK_MAX_FAILS) return;
   }
+  s_fallback_calc_timer = app_timer_register(s_fallback_delay_ms, fallback_calc_cb, NULL);
 }
 
 static void request_location(void) {
@@ -326,6 +390,8 @@ static void inbox_received(DictionaryIterator *iter, void *context) {
   Tuple *t_language = dict_find(iter, MESSAGE_KEY_KEY_LANGUAGE);
 
   bool changed = false;
+  bool canvas_changed = false;
+  bool corner_changed = false;
   if (t_lat && t_lon) {
     s_home.lat_e6 = (int32_t)t_lat->value->int32;
     s_home.lon_e6 = (int32_t)t_lon->value->int32;
@@ -333,11 +399,13 @@ static void inbox_received(DictionaryIterator *iter, void *context) {
     persist_write_int(PERSIST_HOME_LAT_E6, s_home.lat_e6);
     persist_write_int(PERSIST_HOME_LON_E6, s_home.lon_e6);
     changed = true;
+    canvas_changed = true;
   }
   if (t_tz) {
     s_home.tz_offset_min = (int32_t)t_tz->value->int32;
     persist_write_int(PERSIST_HOME_TZ_OFFSET_MIN, s_home.tz_offset_min);
     changed = true;
+    canvas_changed = true;
   }
   (void)t_ts;
 
@@ -345,6 +413,7 @@ static void inbox_received(DictionaryIterator *iter, void *context) {
     s_use_internet_fallback = (t_use_internet->value->uint8 != 0);
     persist_write_int(PERSIST_USE_INTERNET_FALLBACK, s_use_internet_fallback ? 1 : 0);
     changed = true;
+    canvas_changed = true;
   }
   if (t_ui_update_interval) {
     const int next_interval = normalize_ui_update_interval_sec((int)t_ui_update_interval->value->int32);
@@ -352,6 +421,7 @@ static void inbox_received(DictionaryIterator *iter, void *context) {
       s_ui_update_interval_sec = next_interval;
       persist_write_int(PERSIST_UI_UPDATE_INTERVAL_SEC, s_ui_update_interval_sec);
       changed = true;
+      corner_changed = true;
 #ifndef PBL_ROUND
       if (s_ui_timer) {
         app_timer_cancel(s_ui_timer);
@@ -367,6 +437,7 @@ static void inbox_received(DictionaryIterator *iter, void *context) {
       yes_i18n_set_language(s_language);
       persist_write_int(PERSIST_LANGUAGE, s_language);
       changed = true;
+      canvas_changed = true;
     }
   }
 
@@ -377,6 +448,7 @@ static void inbox_received(DictionaryIterator *iter, void *context) {
                                    (int)t_home_sunrise->value->int32,
                                    (int)t_home_sunset->value->int32);
     changed = true;
+    canvas_changed = true;
   }
   if (t_home_moon_state && t_home_moonrise && t_home_moonset) {
     const int state = (int)t_home_moon_state->value->int32;
@@ -384,6 +456,7 @@ static void inbox_received(DictionaryIterator *iter, void *context) {
                                     (int)t_home_moonrise->value->int32,
                                     (int)t_home_moonset->value->int32);
     changed = true;
+    canvas_changed = true;
   }
 
   if (t_moon_phase) {
@@ -393,55 +466,65 @@ static void inbox_received(DictionaryIterator *iter, void *context) {
     s_have_moon_phase = true;
     persist_write_int(PERSIST_HOME_MOON_PHASE_E6, s_moon_phase_e6);
     changed = true;
+    canvas_changed = true;
   }
 
   if (t_tide_have) {
     s_have_tide = (t_tide_have->value->uint8 != 0);
     persist_write_int(PERSIST_TIDE_HAVE, s_have_tide ? 1 : 0);
     changed = true;
+    corner_changed = true;
   }
   if (t_tide_last) {
     s_tide_last_unix = (int32_t)t_tide_last->value->int32;
     if (s_tide_last_unix < 0) s_tide_last_unix = 0;
     persist_write_int(PERSIST_TIDE_LAST_UNIX, s_tide_last_unix);
     changed = true;
+    corner_changed = true;
   }
   if (t_tide_next) {
     s_tide_next_unix = (int32_t)t_tide_next->value->int32;
     if (s_tide_next_unix < 0) s_tide_next_unix = 0;
     persist_write_int(PERSIST_TIDE_NEXT_UNIX, s_tide_next_unix);
     changed = true;
+    corner_changed = true;
   }
   if (t_tide_next_is_high) {
     s_tide_next_is_high = (t_tide_next_is_high->value->uint8 != 0);
     persist_write_int(PERSIST_TIDE_NEXT_IS_HIGH, s_tide_next_is_high ? 1 : 0);
     changed = true;
+    corner_changed = true;
   }
   if (t_tide_level) {
     s_tide_level_x10 = (int16_t)t_tide_level->value->int32;
     persist_write_int(PERSIST_TIDE_LEVEL_X10, s_tide_level_x10);
     changed = true;
+    corner_changed = true;
   }
   if (t_tide_level_is_ft) {
     s_tide_level_is_ft = (t_tide_level_is_ft->value->uint8 != 0);
     persist_write_int(PERSIST_TIDE_LEVEL_IS_FT, s_tide_level_is_ft ? 1 : 0);
     changed = true;
+    corner_changed = true;
   }
 
   if (t_alt_valid) {
     s_alt_valid = (t_alt_valid->value->uint8 != 0);
     persist_write_int(PERSIST_ALT_VALID, s_alt_valid ? 1 : 0);
     changed = true;
+    corner_changed = true;
   }
   if (t_alt_m) {
     s_alt_m = (int32_t)t_alt_m->value->int32;
     persist_write_int(PERSIST_ALT_M, (int)s_alt_m);
     changed = true;
+    corner_changed = true;
   }
   if (t_alt_is_ft) {
     s_alt_is_ft = (t_alt_is_ft->value->uint8 != 0);
     persist_write_int(PERSIST_ALT_IS_FT, s_alt_is_ft ? 1 : 0);
     changed = true;
+    corner_changed = true;
   }
 
   if (t_w_temp) {
@@ -449,24 +532,28 @@ static void inbox_received(DictionaryIterator *iter, void *context) {
     persist_write_int(PERSIST_WEATHER_TEMP_C10, s_weather_temp_c10);
     s_have_weather = true;
     changed = true;
+    corner_changed = true;
   }
   if (t_w_code) {
     s_weather_code = (uint8_t)t_w_code->value->uint8;
     persist_write_int(PERSIST_WEATHER_CODE, (int)s_weather_code);
     s_have_weather = true;
     changed = true;
+    corner_changed = true;
   }
   if (t_w_day) {
     s_weather_is_day = (t_w_day->value->uint8 != 0);
     persist_write_int(PERSIST_WEATHER_IS_DAY, s_weather_is_day ? 1 : 0);
     s_have_weather = true;
     changed = true;
+    corner_changed = true;
   }
   if (t_w_f) {
     s_weather_is_f = (t_w_f->value->uint8 != 0);
     persist_write_int(PERSIST_WEATHER_IS_F, s_weather_is_f ? 1 : 0);
     s_have_weather = true;
     changed = true;
+    corner_changed = true;
   }
 
   if (t_w_wind_spd) {
@@ -474,52 +561,50 @@ static void inbox_received(DictionaryIterator *iter, void *context) {
     persist_write_int(PERSIST_WEATHER_WIND_SPD_X10, s_weather_wind_spd_x10);
     s_have_weather = true;
     changed = true;
+    corner_changed = true;
   }
   if (t_w_wind_dir) {
     s_weather_wind_dir_deg = (int16_t)t_w_wind_dir->value->int32;
     persist_write_int(PERSIST_WEATHER_WIND_DIR_DEG, s_weather_wind_dir_deg);
     s_have_weather = true;
     changed = true;
+    corner_changed = true;
   }
   if (t_w_precip) {
     s_weather_precip_x10 = (int16_t)t_w_precip->value->int32;
     persist_write_int(PERSIST_WEATHER_PRECIP_X10, s_weather_precip_x10);
     s_have_weather = true;
     changed = true;
+    corner_changed = true;
   }
   if (t_w_uv) {
     s_weather_uv_x10 = (int16_t)t_w_uv->value->int32;
     persist_write_int(PERSIST_WEATHER_UV_X10, s_weather_uv_x10);
     s_have_weather = true;
     changed = true;
+    corner_changed = true;
   }
   if (t_w_p) {
     s_weather_pressure_hpa_x10 = (int16_t)t_w_p->value->int32;
     persist_write_int(PERSIST_WEATHER_PRESSURE_HPA_X10, s_weather_pressure_hpa_x10);
     s_have_weather = true;
     changed = true;
+    corner_changed = true;
   }
 
   if (changed) {
+    reset_fallback_backoff();
     s_last_calc_year = s_last_calc_month = s_last_calc_day = -1;
     // Stamp and persist events when phone provides them.
     if (s_home.valid && (t_home_sun_state || t_home_moon_state)) {
       s_home_ymd = ymd_for_loc_now(&s_home, NULL, NULL, NULL);
       persist_save_events_for_home();
     }
-    if (s_canvas_layer) {
-      layer_mark_dirty(s_canvas_layer);
-    }
+    schedule_redraw(canvas_changed, corner_changed);
 #ifndef PBL_ROUND
-    if (s_corner_layer) {
-      layer_mark_dirty(s_corner_layer);
-    }
-#endif
     // Kick the UI alternation timer for corner widgets (tide/weather).
-#ifndef PBL_ROUND
     schedule_ui_timer();
 #endif
-    // If phone isn't available or didn't send events, fallback will fill in.
     schedule_fallback_calc_if_needed();
   }
 
@@ -651,10 +736,11 @@ static void tick_handler(struct tm *tick_time, TimeUnits units_changed) {
   // If the local day rolled over and the phone isn't around to refresh events,
   // compute daily sun/moon events on-watch.
   if (tick_time && tick_time->tm_min == 0) {
+    reset_fallback_backoff();
     schedule_fallback_calc_if_needed();
   }
   if (s_canvas_layer) {
-    layer_mark_dirty(s_canvas_layer);
+    schedule_redraw(true, false);
   }
 }
 
@@ -662,10 +748,10 @@ static void tick_handler(struct tm *tick_time, TimeUnits units_changed) {
 static void debug_toggle(void) {
   s_debug = !s_debug;
   if (s_canvas_layer) {
-    layer_mark_dirty(s_canvas_layer);
+    schedule_redraw(true, false);
   }
 #ifndef PBL_ROUND
-  if (s_corner_layer) layer_mark_dirty(s_corner_layer);
+  if (s_corner_layer) schedule_redraw(false, true);
 #endif
 }
 
@@ -821,7 +907,13 @@ static void accel_tap_handler(AccelAxisType axis, int32_t direction) {
 #ifndef PBL_ROUND
 static void bt_handler(bool connected) {
   (void)connected;
-  if (s_corner_layer) layer_mark_dirty(s_corner_layer);
+  schedule_redraw(false, true);
+#ifndef PBL_ROUND
+  if (!connected) {
+    reset_fallback_backoff();
+    schedule_fallback_calc_if_needed();
+  }
+#endif
 }
 #endif
 
@@ -909,22 +1001,31 @@ static void prv_init(void) {
   schedule_ui_timer();
 #endif
 
-  // Load cached daily events if available for today (per-location local date)
+  // Load cached daily events if available for today (per-location local date).
+  // Sun and moon are independent: the face can run sun-only until moon arrives from the phone.
   if (s_home.valid && persist_exists(PERSIST_HOME_YMD)) {
     const int ymd_now = ymd_for_loc_now(&s_home, NULL, NULL, NULL);
     const int ymd = persist_read_int(PERSIST_HOME_YMD);
-    if (ymd_now != 0 && ymd == ymd_now &&
-        persist_exists(PERSIST_HOME_SUN_STATE) && persist_exists(PERSIST_HOME_SUNRISE_MIN) && persist_exists(PERSIST_HOME_SUNSET_MIN) &&
-        persist_exists(PERSIST_HOME_MOON_STATE) && persist_exists(PERSIST_HOME_MOONRISE_MIN) && persist_exists(PERSIST_HOME_MOONSET_MIN)) {
-      s_home_ymd = ymd;
-      set_sun_from_state_and_minutes(&s_sun_home,
-                                     persist_read_int(PERSIST_HOME_SUN_STATE),
-                                     persist_read_int(PERSIST_HOME_SUNRISE_MIN),
-                                     persist_read_int(PERSIST_HOME_SUNSET_MIN));
-      set_moon_from_state_and_minutes(&s_moon_home,
-                                      persist_read_int(PERSIST_HOME_MOON_STATE),
-                                      persist_read_int(PERSIST_HOME_MOONRISE_MIN),
-                                      persist_read_int(PERSIST_HOME_MOONSET_MIN));
+    if (ymd_now != 0 && ymd == ymd_now) {
+      if (persist_exists(PERSIST_HOME_SUN_STATE) && persist_exists(PERSIST_HOME_SUNRISE_MIN) &&
+          persist_exists(PERSIST_HOME_SUNSET_MIN)) {
+        set_sun_from_state_and_minutes(&s_sun_home,
+                                       persist_read_int(PERSIST_HOME_SUN_STATE),
+                                       persist_read_int(PERSIST_HOME_SUNRISE_MIN),
+                                       persist_read_int(PERSIST_HOME_SUNSET_MIN));
+        if (yes_sun_times_sane(&s_sun_home)) {
+          s_home_ymd = ymd;
+        } else {
+          s_sun_home = (SunTimes){0};
+        }
+      }
+      if (persist_exists(PERSIST_HOME_MOON_STATE) && persist_exists(PERSIST_HOME_MOONRISE_MIN) &&
+          persist_exists(PERSIST_HOME_MOONSET_MIN)) {
+        set_moon_from_state_and_minutes(&s_moon_home,
+                                        persist_read_int(PERSIST_HOME_MOON_STATE),
+                                        persist_read_int(PERSIST_HOME_MOONRISE_MIN),
+                                        persist_read_int(PERSIST_HOME_MOONSET_MIN));
+      }
     }
   }
 
@@ -968,6 +1069,12 @@ static void prv_deinit(void) {
 #if ENABLE_DEBUG_SCREEN
   accel_tap_service_unsubscribe();
 #endif
+  if (s_redraw_timer) {
+    app_timer_cancel(s_redraw_timer);
+    s_redraw_timer = NULL;
+  }
+  s_pending_canvas_redraw = false;
+  s_pending_corner_redraw = false;
   if (s_fallback_calc_timer) {
     app_timer_cancel(s_fallback_calc_timer);
     s_fallback_calc_timer = NULL;

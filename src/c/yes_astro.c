@@ -1,26 +1,27 @@
 #include "yes_astro.h"
 
+#include <math.h>
 #include <stdlib.h>
 
 #ifndef MIN
 #define MIN(a,b) ((a) < (b) ? (a) : (b))
 #endif
 
-// We avoid libm trig (sin/cos/atan/acos/asin) here because the Basalt emulator toolchain
-// has shown app faults in libm argument reduction. Pebble provides safe fixed-point trig
-// via sin_lookup/cos_lookup.
-static inline int32_t deg_e6_to_trig(int32_t deg_e6) {
-  // TRIG_MAX_ANGLE == 360 degrees
-  return (int32_t)((int64_t)TRIG_MAX_ANGLE * (int64_t)deg_e6 / (360LL * 1000000LL));
+#ifndef DEG2RAD
+#define DEG2RAD 0.017453292519943295
+#endif
+
+static double norm_deg(double d) {
+  d = fmod(d, 360.0);
+  if (d < 0.0) d += 360.0;
+  return d;
 }
 
-static inline int32_t rad_e6_to_trig(int32_t rad_e6) {
-  // 2*pi radians == TRIG_MAX_ANGLE; 2*pi*1e6 ~= 6283185
-  return (int32_t)((int64_t)TRIG_MAX_ANGLE * (int64_t)rad_e6 / 6283185LL);
+static double norm_hours(double h) {
+  h = fmod(h, 24.0);
+  if (h < 0.0) h += 24.0;
+  return h;
 }
-
-static inline int32_t trig_sin(int32_t a) { return sin_lookup(a); } // scaled by TRIG_MAX_RATIO
-static inline int32_t trig_cos(int32_t a) { return cos_lookup(a); } // scaled by TRIG_MAX_RATIO
 
 static int day_of_year(int year, int month_1_12, int day_1_31) {
   static const int days_before_month[] = { 0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334 };
@@ -32,10 +33,52 @@ static int day_of_year(int year, int month_1_12, int day_1_31) {
   return doy;
 }
 
-static int32_t clamp_i32(int32_t v, int32_t lo, int32_t hi) {
-  if (v < lo) return lo;
-  if (v > hi) return hi;
-  return v;
+typedef enum {
+  SOLAR_EVENT_OK = 0,
+  SOLAR_EVENT_POLAR_DAY,
+  SOLAR_EVENT_POLAR_NIGHT,
+  SOLAR_EVENT_ERR
+} SolarEventResult;
+
+// Same NOAA approximation as pkjs calcSolarEventLocalHours (matches MET Norway closely).
+static SolarEventResult calc_solar_event_hours(int N, double lat_deg, double lon_deg, double tz_hours,
+                                               bool is_sunrise, double *out_hours) {
+  if (!out_hours) return SOLAR_EVENT_ERR;
+
+  const double lng_hour = lon_deg / 15.0;
+  const double zenith = 90.833;
+  const double t = (double)N + ((is_sunrise ? 6.0 : 18.0) - lng_hour) / 24.0;
+  const double M = (0.9856 * t) - 3.289;
+  double L = M + (1.916 * sin(M * DEG2RAD)) + (0.020 * sin(2.0 * M * DEG2RAD)) + 282.634;
+  L = norm_deg(L);
+
+  double RA = atan(0.91764 * tan(L * DEG2RAD)) / DEG2RAD;
+  RA = norm_deg(RA);
+  const double Lq = floor(L / 90.0) * 90.0;
+  const double RAq = floor(RA / 90.0) * 90.0;
+  RA = (RA + (Lq - RAq)) / 15.0;
+
+  const double sin_dec = 0.39782 * sin(L * DEG2RAD);
+  const double cos_dec = cos(asin(sin_dec));
+  const double cos_h = (cos(zenith * DEG2RAD) - (sin_dec * sin(lat_deg * DEG2RAD))) /
+                       (cos_dec * cos(lat_deg * DEG2RAD));
+
+  if (cos_h > 1.0) return SOLAR_EVENT_POLAR_NIGHT;
+  if (cos_h < -1.0) return SOLAR_EVENT_POLAR_DAY;
+
+  double H = is_sunrise ? (360.0 - (acos(cos_h) / DEG2RAD)) : (acos(cos_h) / DEG2RAD);
+  H /= 15.0;
+  const double T = H + RA - (0.06571 * t) - 6.622;
+  const double UT = norm_hours(T - lng_hour);
+  *out_hours = norm_hours(UT + tz_hours);
+  return SOLAR_EVENT_OK;
+}
+
+static int minutes_from_hours(double hours) {
+  int mins = (int)lround(hours * 60.0);
+  mins %= 1440;
+  if (mins < 0) mins += 1440;
+  return mins;
 }
 
 int32_t yes_tz_offset_min(const GeoLoc *loc) {
@@ -88,69 +131,12 @@ bool get_location_local_tm(const GeoLoc *loc, struct tm *out_tm, int *out_minute
   return yes_local_tm_now(loc, out_tm, out_minutes_since_midnight);
 }
 
-// Compute sin(altitude) of sun at a given minute using NOAA "equation of time" approximation
-// (sin/cos series in gamma). All math is fixed-point using Pebble trig lookup.
-// Returns sin(alt) scaled by TRIG_MAX_RATIO.
-static int32_t sun_sin_alt_scaled(int N, int minute_of_day, int32_t lat_e6, int32_t lon_e6, int32_t tz_offset_min) {
-  // gamma = 2*pi/365 * (N-1 + (minute-720)/1440)
-  const int64_t a = (int64_t)TRIG_MAX_ANGLE * (int64_t)(N - 1) / 365LL;
-  const int64_t b = (int64_t)TRIG_MAX_ANGLE * (int64_t)(minute_of_day - 720) / (365LL * 1440LL);
-  const int32_t gamma = (int32_t)(a + b);
-
-  const int32_t sin1 = trig_sin(gamma);
-  const int32_t cos1 = trig_cos(gamma);
-  const int32_t sin2 = trig_sin(gamma * 2);
-  const int32_t cos2 = trig_cos(gamma * 2);
-  const int32_t sin3 = trig_sin(gamma * 3);
-  const int32_t cos3 = trig_cos(gamma * 3);
-
-  // eqtime (seconds) = 13750800 * (0.000075 + 0.001868 cosγ - 0.032077 sinγ - 0.014615 cos2γ - 0.040849 sin2γ)
-  // We evaluate the bracket term in 1e6 scale, using trig scaled by TRIG_MAX_RATIO.
-  int64_t sum_e6 = 75;
-  sum_e6 += (int64_t)1868  * cos1 / TRIG_MAX_RATIO;
-  sum_e6 += (int64_t)-32077 * sin1 / TRIG_MAX_RATIO;
-  sum_e6 += (int64_t)-14615 * cos2 / TRIG_MAX_RATIO;
-  sum_e6 += (int64_t)-40849 * sin2 / TRIG_MAX_RATIO;
-  const int32_t eqtime_sec = (int32_t)((int64_t)13750800 * sum_e6 / 1000000LL);
-
-  // decl (rad, 1e6 scale):
-  // 0.006918 - 0.399912 cosγ + 0.070257 sinγ - 0.006758 cos2γ + 0.000907 sin2γ - 0.002697 cos3γ + 0.00148 sin3γ
-  int64_t decl_e6 = 6918;
-  decl_e6 += (int64_t)-399912 * cos1 / TRIG_MAX_RATIO;
-  decl_e6 += (int64_t) 70257 * sin1 / TRIG_MAX_RATIO;
-  decl_e6 += (int64_t) -6758 * cos2 / TRIG_MAX_RATIO;
-  decl_e6 += (int64_t)   907 * sin2 / TRIG_MAX_RATIO;
-  decl_e6 += (int64_t) -2697 * cos3 / TRIG_MAX_RATIO;
-  decl_e6 += (int64_t)  1480 * sin3 / TRIG_MAX_RATIO;
-  const int32_t decl_trig = rad_e6_to_trig((int32_t)decl_e6);
-
-  // True solar time (seconds):
-  // tst_min = minutes + eqtime_min + 4*lon - tz_offset_min
-  // => tst_sec = minutes*60 + eqtime_sec + 240*lon_deg - tz_offset_min*60
-  const int64_t lon_term_sec = (int64_t)240 * (int64_t)lon_e6 / 1000000LL;
-  int64_t tst_sec = (int64_t)minute_of_day * 60 + (int64_t)eqtime_sec + lon_term_sec - (int64_t)tz_offset_min * 60;
-  tst_sec %= 86400;
-  if (tst_sec < 0) tst_sec += 86400;
-
-  // Hour angle (deg): ha_deg = tst_sec/240 - 180, then to TRIG:
-  // ha_trig = TRIG_MAX_ANGLE * (tst_sec - 43200) / 86400
-  const int32_t ha_trig = (int32_t)((int64_t)TRIG_MAX_ANGLE * (tst_sec - 43200) / 86400LL);
-
-  const int32_t lat_trig = deg_e6_to_trig(lat_e6);
-  const int32_t sin_lat = trig_sin(lat_trig);
-  const int32_t cos_lat = trig_cos(lat_trig);
-  const int32_t sin_dec = trig_sin(decl_trig);
-  const int32_t cos_dec = trig_cos(decl_trig);
-  const int32_t cos_ha  = trig_cos(ha_trig);
-
-  // sin(alt) = sinφ sinδ + cosφ cosδ cosH
-  int64_t term1 = (int64_t)sin_lat * (int64_t)sin_dec / TRIG_MAX_RATIO;
-  int64_t term2 = (int64_t)cos_lat * (int64_t)cos_dec / TRIG_MAX_RATIO;
-  term2 = term2 * (int64_t)cos_ha / TRIG_MAX_RATIO;
-  int64_t s = term1 + term2;
-  if (s > INT32_MAX) s = INT32_MAX;
-  if (s < INT32_MIN) s = INT32_MIN;
-  return (int32_t)s;
+bool yes_sun_times_sane(const SunTimes *sun) {
+  if (!sun || !sun->valid) return false;
+  if (sun->always_day || sun->always_night) return true;
+  if (sun->sunrise_min < 0 || sun->sunset_min < 0) return false;
+  if (sun->sunrise_min >= sun->sunset_min) return false;
+  return true;
 }
 
 SunTimes calc_sunrise_sunset_local(int year, int month_1_12, int day_1_31,
@@ -158,59 +144,32 @@ SunTimes calc_sunrise_sunset_local(int year, int month_1_12, int day_1_31,
                                    int32_t tz_offset_min) {
   SunTimes out = (SunTimes){ .valid = true, .always_day = false, .always_night = false, .sunrise_min = 0, .sunset_min = 0 };
 
-  // Convert degrees (double) to e6 integers (avoid lround/libm).
-  const int32_t lat_e6 = (int32_t)(lat_deg * 1000000.0 + (lat_deg >= 0 ? 0.5 : -0.5));
-  const int32_t lon_e6 = (int32_t)(lon_deg * 1000000.0 + (lon_deg >= 0 ? 0.5 : -0.5));
+  const double tz_hours = (double)tz_offset_min / 60.0;
   const int N = day_of_year(year, month_1_12, day_1_31);
+  double rise_h = 0.0, set_h = 0.0;
 
-  // Sunrise/sunset convention: sun center at -0.833 degrees altitude (refraction + radius)
-  const int32_t h0_trig = deg_e6_to_trig(-833000);
-  const int32_t sin_h0 = trig_sin(h0_trig);
+  const SolarEventResult rise_r = calc_solar_event_hours(N, lat_deg, lon_deg, tz_hours, true, &rise_h);
+  const SolarEventResult set_r = calc_solar_event_hours(N, lat_deg, lon_deg, tz_hours, false, &set_h);
 
-  const int step = 10; // minutes
-  int rise = -1, set = -1;
-  int above_count = 0;
-
-  int32_t prev_s = sun_sin_alt_scaled(N, 0, lat_e6, lon_e6, tz_offset_min);
-  bool prev_above = (prev_s > sin_h0);
-  if (prev_above) above_count++;
-
-  for (int m = step; m <= 1440; m += step) {
-    const int mm = (m == 1440) ? 1439 : m;
-    const int32_t s = sun_sin_alt_scaled(N, mm, lat_e6, lon_e6, tz_offset_min);
-    const bool above = (s > sin_h0);
-    if (above) above_count++;
-
-    if (above != prev_above) {
-      int lo = m - step;
-      int hi = m;
-      for (int i = 0; i < 10; i++) {
-        const int mid = (lo + hi) / 2;
-        const int32_t sm = sun_sin_alt_scaled(N, mid, lat_e6, lon_e6, tz_offset_min);
-        const bool ab = (sm > sin_h0);
-        if (ab == prev_above) lo = mid; else hi = mid;
-      }
-      if (!prev_above && above) {
-        if (rise < 0) rise = hi;
-      } else if (prev_above && !above) {
-        if (set < 0) set = hi;
-      }
-    }
-
-    prev_above = above;
+  if (rise_r == SOLAR_EVENT_POLAR_DAY || set_r == SOLAR_EVENT_POLAR_DAY) {
+    out.always_day = true;
+    return out;
   }
-
-  if (rise < 0 && set < 0) {
-    const int samples = (1440 / step);
-    if (above_count > samples / 2) out.always_day = true;
-    else out.always_night = true;
+  if (rise_r == SOLAR_EVENT_POLAR_NIGHT || set_r == SOLAR_EVENT_POLAR_NIGHT) {
+    out.always_night = true;
+    return out;
+  }
+  if (rise_r != SOLAR_EVENT_OK || set_r != SOLAR_EVENT_OK) {
+    out.valid = false;
     return out;
   }
 
-  if (rise < 0) rise = 0;
-  if (set < 0) set = 0;
-  out.sunrise_min = clamp_i32(rise, 0, 1439);
-  out.sunset_min  = clamp_i32(set, 0, 1439);
+  out.sunrise_min = minutes_from_hours(rise_h);
+  out.sunset_min = minutes_from_hours(set_h);
+  if (!yes_sun_times_sane(&out)) {
+    out.valid = false;
+    out.sunrise_min = 0;
+    out.sunset_min = 0;
+  }
   return out;
 }
-
