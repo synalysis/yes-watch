@@ -49,7 +49,8 @@ const KEYS = {
 
   USE_INTERNET_FALLBACK: 'KEY_USE_INTERNET_FALLBACK',
   UI_UPDATE_INTERVAL_SEC: 'KEY_UI_UPDATE_INTERVAL_SEC',
-  LANGUAGE: 'KEY_LANGUAGE'
+  LANGUAGE: 'KEY_LANGUAGE',
+  DISPLAY_MODE: 'KEY_DISPLAY_MODE'
 };
 
 function log() {
@@ -584,6 +585,27 @@ function sendUiUpdateInterval() {
   payload[KEYS.UI_UPDATE_INTERVAL_SEC] = readUpdateIntervalSecFromStorage();
   sendQueued(payload);
 }
+
+function normalizeDisplayMode(v) {
+  const n = parseInt(v, 10);
+  if (n === 1 || n === 2) return n;
+  return 0;
+}
+
+function readDisplayModeFromStorage() {
+  try {
+    return normalizeDisplayMode(localStorage.getItem('displayMode'));
+  } catch (e) {
+    return 0;
+  }
+}
+
+function sendDisplayMode() {
+  const payload = {};
+  payload[KEYS.DISPLAY_MODE] = readDisplayModeFromStorage();
+  sendQueued(payload);
+}
+
 
 function sendAltitudeUnitForLocation(latE6, lonE6) {
   const payload = {};
@@ -1446,7 +1468,12 @@ const CONFIG_I18N = {
     closestCity: 'Closest city',
     locationUnknown: 'Location not available yet',
     seconds: 'seconds',
-    save: 'Save'
+    save: 'Save',
+    displayMode: 'Display mode',
+    displayNormal: 'Normal',
+    displayMinimalism: 'Minimalism',
+    displayStrict: 'Strict Minimalism',
+    displayModeHint: 'Minimalism removes the hour scale and expands the dial. Strict Minimalism also hides corner data and the digital time.'
   },
   de: {
     title: 'YES Watchface Einstellungen',
@@ -1464,7 +1491,12 @@ const CONFIG_I18N = {
     closestCity: 'Nächste Stadt',
     locationUnknown: 'Standort noch nicht verfügbar',
     seconds: 'Sekunden',
-    save: 'Speichern'
+    save: 'Speichern',
+    displayMode: 'Anzeigemodus',
+    displayNormal: 'Normal',
+    displayMinimalism: 'Minimalismus',
+    displayStrict: 'Strenger Minimalismus',
+    displayModeHint: 'Minimalismus entfernt die Stundenskala und vergrößert den Kreis. Strenger Minimalismus blendet zusätzlich Ecken und digitale Uhrzeit aus.'
   },
   fr: {
     title: 'Paramètres YES Watchface',
@@ -1482,7 +1514,12 @@ const CONFIG_I18N = {
     closestCity: 'Ville la plus proche',
     locationUnknown: 'Emplacement pas encore disponible',
     seconds: 'secondes',
-    save: 'Enregistrer'
+    save: 'Enregistrer',
+    displayMode: 'Mode d\'affichage',
+    displayNormal: 'Normal',
+    displayMinimalism: 'Minimalisme',
+    displayStrict: 'Minimalisme strict',
+    displayModeHint: 'Le minimalisme retire l\'échelle horaire et agrandit le cadran. Le minimalisme strict masque aussi les coins et l\'heure numérique.'
   },
   es: {
     title: 'Ajustes de YES Watchface',
@@ -1500,7 +1537,12 @@ const CONFIG_I18N = {
     closestCity: 'Ciudad más cercana',
     locationUnknown: 'Ubicación aún no disponible',
     seconds: 'segundos',
-    save: 'Guardar'
+    save: 'Guardar',
+    displayMode: 'Modo de visualización',
+    displayNormal: 'Normal',
+    displayMinimalism: 'Minimalismo',
+    displayStrict: 'Minimalismo estricto',
+    displayModeHint: 'El minimalismo quita la escala horaria y amplía el círculo. El minimalismo estricto también oculta las esquinas y la hora digital.'
   },
   pt: {
     title: 'Definições YES Watchface',
@@ -1518,7 +1560,12 @@ const CONFIG_I18N = {
     closestCity: 'Cidade mais próxima',
     locationUnknown: 'Localização ainda indisponível',
     seconds: 'segundos',
-    save: 'Guardar'
+    save: 'Guardar',
+    displayMode: 'Modo de apresentação',
+    displayNormal: 'Normal',
+    displayMinimalism: 'Minimalismo',
+    displayStrict: 'Minimalismo estrito',
+    displayModeHint: 'O minimalismo remove a escala horária e amplia o círculo. O minimalismo estrito também oculta os cantos e a hora digital.'
   },
   it: {
     title: 'Impostazioni YES Watchface',
@@ -1536,7 +1583,12 @@ const CONFIG_I18N = {
     closestCity: 'Città più vicina',
     locationUnknown: 'Posizione non ancora disponibile',
     seconds: 'secondi',
-    save: 'Salva'
+    save: 'Salva',
+    displayMode: 'Modalità di visualizzazione',
+    displayNormal: 'Normale',
+    displayMinimalism: 'Minimalismo',
+    displayStrict: 'Minimalismo rigoroso',
+    displayModeHint: 'Il minimalismo rimuove la scala oraria e allarga il quadrante. Il minimalismo rigoroso nasconde anche gli angoli e l\'ora digitale.'
   }
 };
 
@@ -1550,9 +1602,10 @@ function getUiModelFromStorage() {
   const unitsMode = readUnitsModeFromStorage();
   const uiUpdateIntervalSec = readUpdateIntervalSecFromStorage();
   const language = readLanguageFromStorage();
+  const displayMode = readDisplayModeFromStorage();
   const locationDisplay = getLocationDisplayForConfig();
 
-  return { useInternet, unitsMode, uiUpdateIntervalSec, language, locationDisplay };
+  return { useInternet, unitsMode, uiUpdateIntervalSec, language, displayMode, locationDisplay };
 }
 
 function configLanguageOptionsHtml() {
@@ -1562,7 +1615,7 @@ function configLanguageOptionsHtml() {
   }).join('\n      ');
 }
 
-function configHtml(useInternet, unitsMode, uiUpdateIntervalSec, language, locationDisplay) {
+function configHtml(useInternet, unitsMode, uiUpdateIntervalSec, language, displayMode, locationDisplay) {
   // Inline config page.
   // IMPORTANT: localStorage is disabled for `data:` URLs in many browsers, so do NOT access it here.
   // We inject initial values from pkjs instead and return the user's changes via return_to/pebblejs://close.
@@ -1621,6 +1674,15 @@ function configHtml(useInternet, unitsMode, uiUpdateIntervalSec, language, locat
     </select>
     <div class="hint">${L.languageHint}</div>
   </div>
+  <div class="row">
+    <label>${L.displayMode}</label>
+    <select id="displayMode">
+      <option value="0">${L.displayNormal}</option>
+      <option value="1">${L.displayMinimalism}</option>
+      <option value="2">${L.displayStrict}</option>
+    </select>
+    <div class="hint">${L.displayModeHint}</div>
+  </div>
   <button id="save">${L.save}</button>
 
   <script>
@@ -1628,6 +1690,7 @@ function configHtml(useInternet, unitsMode, uiUpdateIntervalSec, language, locat
     const INITIAL_UNITS_MODE = ${JSON.stringify(normalizeUnitsMode(unitsMode) || 'metric')};
     const INITIAL_UI_UPDATE_INTERVAL_SEC = ${JSON.stringify(normalizeUpdateIntervalSec(uiUpdateIntervalSec))};
     const INITIAL_LANGUAGE = ${JSON.stringify(languageCode)};
+    const INITIAL_DISPLAY_MODE = ${JSON.stringify(normalizeDisplayMode(displayMode))};
 
     function closeWith(payload) {
       const encoded = encodeURIComponent(JSON.stringify(payload));
@@ -1651,6 +1714,7 @@ function configHtml(useInternet, unitsMode, uiUpdateIntervalSec, language, locat
         document.getElementById('unitsMode').value = INITIAL_UNITS_MODE;
         document.getElementById('uiUpdateIntervalSec').value = String(INITIAL_UI_UPDATE_INTERVAL_SEC);
         document.getElementById('language').value = INITIAL_LANGUAGE;
+        document.getElementById('displayMode').value = String(INITIAL_DISPLAY_MODE);
       } catch (e) {}
     }
 
@@ -1659,11 +1723,13 @@ function configHtml(useInternet, unitsMode, uiUpdateIntervalSec, language, locat
       const unitsMode = document.getElementById('unitsMode').value === 'imperial' ? 'imperial' : 'metric';
       const uiUpdateIntervalSec = parseInt(document.getElementById('uiUpdateIntervalSec').value, 10);
       const language = document.getElementById('language').value;
+      const displayMode = parseInt(document.getElementById('displayMode').value, 10);
       closeWith({
         useInternet: !!useInternet,
         unitsMode: unitsMode,
         uiUpdateIntervalSec: uiUpdateIntervalSec,
-        language: language
+        language: language,
+        displayMode: displayMode
       });
     }
 
@@ -1684,6 +1750,7 @@ Pebble.addEventListener('ready', () => {
   sendLanguage();
   sendUseInternetFlag();
   sendUiUpdateInterval();
+  sendDisplayMode();
   setInterval(maybeRefreshLocation, 10 * 60 * 1000);
 
   // Re-send astro data periodically (handles date rollovers even if GPS doesn't change)
@@ -1711,7 +1778,7 @@ Pebble.addEventListener('showConfiguration', () => {
   const ui = getUiModelFromStorage();
   sendLanguage();
   const url = 'data:text/html;charset=utf-8,' + encodeURIComponent(
-    configHtml(ui.useInternet, ui.unitsMode, ui.uiUpdateIntervalSec, ui.language, ui.locationDisplay)
+    configHtml(ui.useInternet, ui.unitsMode, ui.uiUpdateIntervalSec, ui.language, ui.displayMode, ui.locationDisplay)
   );
   Pebble.openURL(url);
 });
@@ -1744,6 +1811,14 @@ Pebble.addEventListener('webviewclosed', (e) => {
       localStorage.setItem('language', nextLanguage);
       if (prevLanguage !== nextLanguage) {
         sendLanguage();
+      }
+    }
+    if (payload && typeof payload.displayMode !== 'undefined') {
+      const prevMode = readDisplayModeFromStorage();
+      const nextMode = normalizeDisplayMode(payload.displayMode);
+      localStorage.setItem('displayMode', String(nextMode));
+      if (prevMode !== nextMode) {
+        sendDisplayMode();
       }
     }
   } catch (err) {

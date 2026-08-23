@@ -83,6 +83,7 @@ enum {
   PERSIST_USE_INTERNET_FALLBACK = 140,
   PERSIST_UI_UPDATE_INTERVAL_SEC = 141,
   PERSIST_LANGUAGE = 142,
+  PERSIST_DISPLAY_MODE = 143,
 
   // Tides (US-only NOAA; phone sends data when a nearby station is within 50km)
   PERSIST_TIDE_HAVE = 150,
@@ -113,6 +114,7 @@ static GeoLoc s_home;
 static bool s_use_internet_fallback;
 static int s_ui_update_interval_sec = 5;
 static int s_language = YES_LANG_EN;
+static int s_display_mode = YES_DISPLAY_MODE_NORMAL;
 
 static SunTimes s_sun_home;
 
@@ -388,6 +390,7 @@ static void inbox_received(DictionaryIterator *iter, void *context) {
   Tuple *t_use_internet = dict_find(iter, MESSAGE_KEY_KEY_USE_INTERNET_FALLBACK);
   Tuple *t_ui_update_interval = dict_find(iter, MESSAGE_KEY_KEY_UI_UPDATE_INTERVAL_SEC);
   Tuple *t_language = dict_find(iter, MESSAGE_KEY_KEY_LANGUAGE);
+  Tuple *t_display_mode = dict_find(iter, MESSAGE_KEY_KEY_DISPLAY_MODE);
 
   bool changed = false;
   bool canvas_changed = false;
@@ -438,6 +441,16 @@ static void inbox_received(DictionaryIterator *iter, void *context) {
       persist_write_int(PERSIST_LANGUAGE, s_language);
       changed = true;
       canvas_changed = true;
+    }
+  }
+  if (t_display_mode) {
+    const int next_mode = yes_normalize_display_mode((int)t_display_mode->value->int32);
+    if (s_display_mode != next_mode) {
+      s_display_mode = next_mode;
+      persist_write_int(PERSIST_DISPLAY_MODE, s_display_mode);
+      changed = true;
+      canvas_changed = true;
+      corner_changed = true;
     }
   }
 
@@ -815,6 +828,7 @@ static void canvas_update_proc(Layer *layer, GContext *ctx) {
                 s_weather_pressure_hpa_x10,
                 s_have_moon_phase,
                 s_moon_phase_e6,
+                s_display_mode,
                 active_loc(),
                 active_sun(),
                 active_moon());
@@ -858,6 +872,7 @@ static void corner_update_proc(Layer *layer, GContext *ctx) {
                    s_have_moon_phase,
                    s_moon_phase_e6,
                    s_ui_update_interval_sec,
+                   s_display_mode,
                    active_loc(),
                    active_sun(),
                    active_moon());
@@ -940,6 +955,9 @@ static void prv_init(void) {
     ? yes_i18n_normalize_language(persist_read_int(PERSIST_LANGUAGE))
     : YES_LANG_EN;
   yes_i18n_set_language(s_language);
+  s_display_mode = persist_exists(PERSIST_DISPLAY_MODE)
+    ? yes_normalize_display_mode(persist_read_int(PERSIST_DISPLAY_MODE))
+    : YES_DISPLAY_MODE_NORMAL;
   s_last_calc_year = s_last_calc_month = s_last_calc_day = -1;
   clear_events();
   s_have_moon_phase = false;

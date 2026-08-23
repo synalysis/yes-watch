@@ -1,7 +1,7 @@
 {
   "name": "pebble-yes-watch",
   "author": "Andreas Pehnack",
-  "version": "1.2.7",
+  "version": "1.3.0",
   "keywords": ["yes watch", "moon phase", "sunrise", "sunset"],
   "private": true,
   "scripts": {
@@ -67,7 +67,8 @@
       "KEY_WEATHER_PRESSURE_HPA_X10",
       "KEY_USE_INTERNET_FALLBACK",
       "KEY_UI_UPDATE_INTERVAL_SEC",
-      "KEY_LANGUAGE"
+      "KEY_LANGUAGE",
+      "KEY_DISPLAY_MODE"
     ],
     "resources": {
       "media": []

@@ -1312,6 +1312,7 @@ void yes_draw_face(Layer *layer, GContext *ctx,
                      int16_t weather_pressure_hpa_x10,
                      bool have_phase,
                      int32_t moon_phase_e6,
+                     int display_mode,
                      const GeoLoc *loc,
                      const SunTimes *sun_times,
                      const MoonTimes *moon_times) {
@@ -1533,7 +1534,15 @@ void yes_draw_face(Layer *layer, GContext *ctx,
   const GColor col_moon_up = GColorWhite;
 #endif
 
-  const uint16_t moon_inset = (uint16_t)scale_px(22, face_r);
+  // Minimalism / Strict Minimalism: no hour scale/labels, so the dial can expand to the
+  // display edges. Keep a small margin so the moon ring does not clip.
+  const bool minimal = (display_mode == YES_DISPLAY_MODE_MINIMALISM ||
+                        display_mode == YES_DISPLAY_MODE_STRICT_MINIMALISM);
+  // Leave enough margin for corner complications and digital time so text
+  // does not intrude into the moon ring / solar disk.
+  const uint16_t moon_inset = minimal
+    ? (uint16_t)scale_px(10, face_r)
+    : (uint16_t)scale_px(22, face_r);
 #ifdef PBL_COLOR
   const uint16_t moon_base_thickness = (uint16_t)scale_px(5, face_r);
   const uint16_t moon_up_thickness = (uint16_t)scale_px(5, face_r);
@@ -1582,11 +1591,14 @@ void yes_draw_face(Layer *layer, GContext *ctx,
     }
   }
 
-  draw_outer_scale(ctx, bounds, moon_inset, moon_up_thickness);
+  if (!minimal) {
+    draw_outer_scale(ctx, bounds, moon_inset, moon_up_thickness);
+  }
 
-  // Moon phase disk
+  // Moon phase disk: scale the full phase rendering (disk + crescent/shadow)
+  // with the expanded dial, not only the outline.
   {
-    const int moon_r = scale_px(9, face_r);
+    const int moon_r = minimal ? scale_px(14, face_r) : scale_px(9, face_r);
     const GPoint moon_c = GPoint(c.x, (int16_t)(c.y + min_dim / 5));
     double phase = moon_phase_0_1(time(NULL)); // fallback
     if (have_phase) {
@@ -1604,7 +1616,8 @@ void yes_draw_face(Layer *layer, GContext *ctx,
 
   const int32_t hand_angle = angle_from_local_minutes_24h(minutes);
   const int16_t solar_r = (int16_t)(face_r - (int16_t)solar_inset - scale_px(2, face_r));
-  const int16_t hand_len = (int16_t)MIN(solar_r, (int16_t)(face_r - scale_px(18, face_r)));
+  const int16_t hand_margin = minimal ? scale_px(12, face_r) : scale_px(18, face_r);
+  const int16_t hand_len = (int16_t)MIN(solar_r, (int16_t)(face_r - hand_margin));
 
   // Yes-watch-like tapered arrow hand (filled polygon + subtle outline)
   if (s_hand_path && hand_len > 16) {
@@ -1682,21 +1695,28 @@ void yes_draw_face(Layer *layer, GContext *ctx,
     graphics_fill_circle(ctx, c, scale_px(4, face_r));
   }
 
-  char time_buf[12];
-  clock_copy_time_string(time_buf, sizeof(time_buf));
+  // Digital time: Normal/Minimalism only. Strict Minimalism hides it.
+  // Position remains slightly above the geometric center (independent of ring expansion).
+  if (display_mode != YES_DISPLAY_MODE_STRICT_MINIMALISM) {
+    char time_buf[12];
+    clock_copy_time_string(time_buf, sizeof(time_buf));
 
-  // Digital time (top half between center and moon ring)
-  {
-    const int16_t ring_center_r = (int16_t)(face_r - (int16_t)moon_inset);
-    const int16_t ring_inner_r = (int16_t)(ring_center_r - (int16_t)(moon_up_thickness / 2));
-    const int16_t y_center = (int16_t)(c.y - ring_inner_r / 2);
+    const int16_t time_h = (min_dim >= 200) ? scale_px(34, face_r) : scale_px(28, face_r);
+    int16_t y_center;
+    if (minimal) {
+      // Fixed offset slightly above center so expansion of the dial does not push the time up.
+      y_center = (int16_t)(c.y - scale_px(18, face_r));
+    } else {
+      const int16_t ring_center_r = (int16_t)(face_r - (int16_t)moon_inset);
+      const int16_t ring_inner_r = (int16_t)(ring_center_r - (int16_t)(moon_up_thickness / 2));
+      y_center = (int16_t)(c.y - ring_inner_r / 2);
+    }
 
     // On both color and B/W: black on day, white on night.
     const GColor time_col = top_is_night ? GColorWhite : GColorBlack;
     graphics_context_set_text_color(ctx, time_col);
     const GFont f_time = (min_dim >= 200) ? fonts_get_system_font(FONT_KEY_GOTHIC_28_BOLD)
                                           : fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD);
-    const int16_t time_h = (min_dim >= 200) ? scale_px(34, face_r) : scale_px(28, face_r);
 
     const GRect time_rect = GRect(0, (int16_t)(y_center - time_h / 2), bounds.size.w, time_h);
     graphics_draw_text(ctx, time_buf, f_time,
@@ -1749,6 +1769,7 @@ void yes_draw_corners(Layer *layer, GContext *ctx,
                       bool have_phase,
                       int32_t moon_phase_e6,
                       int ui_update_interval_sec,
+                      int display_mode,
                       const GeoLoc *loc,
                       const SunTimes *sun_times,
                       const MoonTimes *moon_times) {
@@ -1756,6 +1777,8 @@ void yes_draw_corners(Layer *layer, GContext *ctx,
   // Mirror the old behavior: no corners on debug or loading screen.
   if (debug) return;
   if (!(have_loc && have_sun)) return;
+  // Strict Minimalism: suppress all corner complications.
+  if (display_mode == YES_DISPLAY_MODE_STRICT_MINIMALISM) return;
 
   const GRect bounds = layer_get_bounds(layer);
   const int min_dim = (int)MIN(bounds.size.w, bounds.size.h);
@@ -1873,6 +1896,7 @@ void yes_draw_corners(Layer *layer, GContext *ctx,
                       bool have_phase,
                       int32_t moon_phase_e6,
                       int ui_update_interval_sec,
+                      int display_mode,
                       const GeoLoc *loc,
                       const SunTimes *sun_times,
                       const MoonTimes *moon_times) {
@@ -1883,7 +1907,7 @@ void yes_draw_corners(Layer *layer, GContext *ctx,
   (void)have_weather; (void)weather_temp_c10; (void)weather_code; (void)weather_is_day; (void)weather_is_f;
   (void)weather_wind_spd_x10; (void)weather_wind_dir_deg; (void)weather_precip_x10; (void)weather_uv_x10; (void)weather_pressure_hpa_x10;
   (void)have_phase; (void)moon_phase_e6;
-  (void)ui_update_interval_sec;
+  (void)ui_update_interval_sec; (void)display_mode;
   (void)loc; (void)sun_times; (void)moon_times;
 }
 #endif
