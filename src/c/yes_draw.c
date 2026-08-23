@@ -847,7 +847,14 @@ static void draw_top_right_date(const CornerCtx *c, bool date_only) {
     GTextOverflowModeTrailingEllipsis, GTextAlignmentRight
   );
   const int16_t pad_px = scale_px(2, c->face_r);
-  int16_t date_w = (int16_t)(date_sz.w + pad_px);
+  // Size the opaque backing to the glyph box, not the taller layout cell, so the
+  // inner corner does not stamp a rectangle into the moon ring.
+  int16_t date_w = (int16_t)date_sz.w;
+  int16_t date_h = (int16_t)date_sz.h;
+  if (date_h > h) date_h = h;
+  // Pebble Gothic cells include extra descent; trim it off the fill.
+  const int16_t descent_trim = scale_px(4, c->face_r);
+  if (date_h > descent_trim + 8) date_h = (int16_t)(date_h - descent_trim);
   int16_t detail_w = (int16_t)(MAX(year_sz.w, weekday_sz.w) + pad_px);
   if (date_w > max_w) date_w = max_w;
   if (detail_w > max_w) detail_w = max_w;
@@ -857,12 +864,14 @@ static void draw_top_right_date(const CornerCtx *c, bool date_only) {
   const int16_t detail_right = (int16_t)(right + detail_nudge_right);
   const int16_t date_x = (int16_t)(right - date_w);
   const int16_t detail_x = (int16_t)(detail_right - detail_w);
-  const int16_t detail_y = (int16_t)(pad + h - scale_px(4, c->face_r) - detail_nudge_up);
+  const int16_t detail_y = (int16_t)(pad + date_h - scale_px(2, c->face_r) - detail_nudge_up);
 
   graphics_context_set_fill_color(c->ctx, GColorBlack);
-  graphics_fill_rect(c->ctx, GRect(date_x, pad, date_w, h), 0, GCornerNone);
-  if (detail && detail[0]) {
-    graphics_fill_rect(c->ctx, GRect(detail_x, detail_y, detail_w, detail_h), 0, GCornerNone);
+  if (!date_only) {
+    graphics_fill_rect(c->ctx, GRect(date_x, pad, date_w, date_h), 0, GCornerNone);
+    if (detail && detail[0]) {
+      graphics_fill_rect(c->ctx, GRect(detail_x, detail_y, detail_w, detail_h), 0, GCornerNone);
+    }
   }
 
   graphics_context_set_text_color(c->ctx, c->color_txt);
@@ -1717,10 +1726,12 @@ void yes_draw_face(Layer *layer, GContext *ctx,
     char time_buf[12];
     clock_copy_time_string(time_buf, sizeof(time_buf));
 
-    const int16_t time_h = (min_dim >= 200) ? scale_px(34, face_r) : scale_px(28, face_r);
+    const int16_t time_h = minimal
+      ? ((min_dim >= 200) ? scale_px(42, face_r) : scale_px(34, face_r))
+      : ((min_dim >= 200) ? scale_px(34, face_r) : scale_px(28, face_r));
     int16_t y_center;
     if (minimal) {
-      y_center = (int16_t)(c.y - scale_px(18, face_r));
+      y_center = (int16_t)(c.y - scale_px(20, face_r));
     } else {
       const int16_t ring_center_r = (int16_t)(face_r - (int16_t)moon_inset);
       const int16_t ring_inner_r = (int16_t)(ring_center_r - (int16_t)(moon_up_thickness / 2));
@@ -1730,8 +1741,15 @@ void yes_draw_face(Layer *layer, GContext *ctx,
     // On both color and B/W: black on day, white on night.
     const GColor time_col = top_is_night ? GColorWhite : GColorBlack;
     graphics_context_set_text_color(ctx, time_col);
-    const GFont f_time = (min_dim >= 200) ? fonts_get_system_font(FONT_KEY_GOTHIC_28_BOLD)
-                                          : fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD);
+    GFont f_time;
+    if (minimal) {
+      const bool use_leco = (min_dim >= 200) && clock_is_24h_style();
+      f_time = fonts_get_system_font(use_leco ? FONT_KEY_LECO_36_BOLD_NUMBERS
+                                              : FONT_KEY_GOTHIC_28_BOLD);
+    } else {
+      f_time = fonts_get_system_font((min_dim >= 200) ? FONT_KEY_GOTHIC_28_BOLD
+                                                      : FONT_KEY_GOTHIC_24_BOLD);
+    }
 
     const GRect time_rect = GRect(0, (int16_t)(y_center - time_h / 2), bounds.size.w, time_h);
     graphics_draw_text(ctx, time_buf, f_time,

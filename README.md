@@ -14,7 +14,7 @@ The project is designed to run well on both **color** and **black/white** Pebble
 - **Moon ring** showing “moon up” interval
 - **Moon phase disk** (with smoothing near full/new so it looks clean)
 - **Loading screen** until valid location + astro data are available
-- **Display modes**: Normal, Minimalism (no hour scale/labels; expanded dial; slightly larger moon; digital time and corners remain), Strict Minimalism (as Minimalism, but without digital time and corner complications)
+- **Display modes**: Normal, Minimalism (no hour scale/labels; expanded dial; digital time and corners remain), Strict Minimalism (as Minimalism, but without digital time and corner complications)
 
 ## Build
 
