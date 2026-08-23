@@ -247,23 +247,37 @@ static int16_t isqrt16(int16_t n) {
   return x;
 }
 
+// Offset-circle moon: lit disk + shadow of the same (or slightly larger) radius.
+// offset = 0   → shadow covers the disk (new moon)
+// offset = 2r  → shadow is off the disk (full moon)
+static int16_t moon_shadow_offset(int radius, double phase) {
+  const double t = 1.0 - 2.0 * fabs(phase - 0.5); // 0 at new, 1 at full
+  int16_t d = (int16_t)lround(2.0 * (double)radius * t);
+  if (d < 0) d = 0;
+  if (d > 2 * radius) d = (int16_t)(2 * radius);
+  return d;
+}
+
 #ifndef PBL_ROUND
 static int s_draw_min_dim;
 #endif
 
-static void draw_moon_fast(GContext *ctx, GPoint center, int radius, double phase) {
+static void draw_moon_fast(GContext *ctx, GPoint center, int radius, double phase, GColor shadow_col) {
   const double eps = 0.015;
   if (phase < 0) phase = 0;
   if (phase > 1) phase = 1;
+  const int shadow_r = radius + 1;
 
-  if (phase < eps) {
-    graphics_context_set_fill_color(ctx, GColorBlack);
+  graphics_context_set_stroke_width(ctx, 1);
+
+  if (phase < eps || phase > 1.0 - eps) {
+    graphics_context_set_fill_color(ctx, shadow_col);
     graphics_fill_circle(ctx, center, radius);
     graphics_context_set_stroke_color(ctx, GColorWhite);
     graphics_draw_circle(ctx, center, radius);
     return;
   }
-  if (phase > 1.0 - eps || fabs(phase - 0.5) < eps) {
+  if (fabs(phase - 0.5) < eps) {
     graphics_context_set_fill_color(ctx, GColorWhite);
     graphics_fill_circle(ctx, center, radius);
     graphics_context_set_stroke_color(ctx, GColorWhite);
@@ -275,18 +289,18 @@ static void draw_moon_fast(GContext *ctx, GPoint center, int radius, double phas
   graphics_fill_circle(ctx, center, radius);
 
   const bool waxing = (phase < 0.5);
-  const int16_t offset = (int16_t)lround(2.0 * (double)radius * fabs(2.0 * (phase - 0.5)));
+  const int16_t offset = moon_shadow_offset(shadow_r, phase);
   const GPoint shadow_c = GPoint((int16_t)(center.x + (waxing ? -offset : offset)), center.y);
-  graphics_context_set_fill_color(ctx, GColorBlack);
-  graphics_fill_circle(ctx, shadow_c, radius);
+  graphics_context_set_fill_color(ctx, shadow_col);
+  graphics_fill_circle(ctx, shadow_c, shadow_r);
   graphics_context_set_stroke_color(ctx, GColorWhite);
   graphics_draw_circle(ctx, center, radius);
 }
 
-static void draw_moon(GContext *ctx, GPoint center, int radius, double phase) {
+static void draw_moon(GContext *ctx, GPoint center, int radius, double phase, GColor shadow_col) {
 #ifndef PBL_ROUND
   if (s_draw_min_dim >= 200) {
-    draw_moon_fast(ctx, center, radius, phase);
+    draw_moon_fast(ctx, center, radius, phase, shadow_col);
     return;
   }
 #endif
@@ -298,9 +312,11 @@ static void draw_moon(GContext *ctx, GPoint center, int radius, double phase) {
 
   if (radius <= 0) return;
 
+  graphics_context_set_stroke_width(ctx, 1);
+
   if (phase < eps || phase > 1.0 - eps) {
-    // New moon: dark disk with bright outline
-    graphics_context_set_fill_color(ctx, GColorBlack);
+    // New moon: unlit disk with thin bright outline
+    graphics_context_set_fill_color(ctx, shadow_col);
     graphics_fill_circle(ctx, center, radius);
     graphics_context_set_stroke_color(ctx, GColorWhite);
     graphics_draw_circle(ctx, center, radius);
@@ -320,14 +336,12 @@ static void draw_moon(GContext *ctx, GPoint center, int radius, double phase) {
   graphics_context_set_fill_color(ctx, GColorWhite);
   graphics_fill_circle(ctx, center, radius);
 
-  // Shadow mask: same concept as the old "offset circle", but clipped to the moon disk via scanlines.
-  const double d = 2.0 * (double)radius * (1.0 - 2.0 * fabs(phase - 0.5)); // 0..2r
-  int16_t offset = (int16_t)lround(d);
-  if (offset < 0) offset = 0;
-  if (offset > 2 * radius) offset = (int16_t)(2 * radius);
-  // When offset is ~2r the shadow-mask circle is tangent to the moon disk, which can produce
-  // a single dark pixel. Treat this as "full enough" and draw no shadow.
-  if (offset >= (int16_t)(2 * radius - 1)) {
+  // Shadow slightly larger than the disk so a 1px outline does not leave a white halo
+  // at the terminator. Offset 0 covers the disk (new), offset 2r leaves it (full).
+  const int shadow_r = radius + 1;
+  const int16_t offset = moon_shadow_offset(shadow_r, phase);
+  // Near-full: shadow is tangent/off the disk. Keep the white base.
+  if (offset >= (int16_t)(2 * shadow_r - 1)) {
     graphics_context_set_stroke_color(ctx, GColorWhite);
     graphics_draw_circle(ctx, center, radius);
     return;
@@ -335,14 +349,17 @@ static void draw_moon(GContext *ctx, GPoint center, int radius, double phase) {
   const bool waxing = (phase < 0.5);
   const int16_t dx = waxing ? (int16_t)(-offset) : offset;
 
-  graphics_context_set_stroke_color(ctx, GColorBlack);
+  graphics_context_set_stroke_color(ctx, shadow_col);
   graphics_context_set_stroke_width(ctx, 1);
 
   const int16_t r = (int16_t)radius;
+  const int16_t rs = (int16_t)shadow_r;
   for (int16_t yy = -r; yy <= r; yy++) {
     const int16_t x_disk = isqrt16((int16_t)(r * r - yy * yy));
-    int16_t x1 = (int16_t)(dx - x_disk);
-    int16_t x2 = (int16_t)(dx + x_disk);
+    const int32_t sh2 = (int32_t)rs * (int32_t)rs - (int32_t)yy * (int32_t)yy;
+    const int16_t x_sh = (sh2 > 0) ? isqrt16((int16_t)sh2) : 0;
+    int16_t x1 = (int16_t)(dx - x_sh);
+    int16_t x2 = (int16_t)(dx + x_sh);
     // Clip to the moon disk extents for this scanline.
     if (x1 < -x_disk) x1 = (int16_t)(-x_disk);
     if (x2 >  x_disk) x2 = x_disk;
@@ -353,7 +370,8 @@ static void draw_moon(GContext *ctx, GPoint center, int radius, double phase) {
     }
   }
 
-  // Outline
+  // Thin outline (callers may have left a thick stroke from the moon-up ring)
+  graphics_context_set_stroke_width(ctx, 1);
   graphics_context_set_stroke_color(ctx, GColorWhite);
   graphics_draw_circle(ctx, center, radius);
 }
@@ -783,7 +801,7 @@ static int slot_pick_index(const SlotComp *comps, int count, const CornerCtx *c,
   return idxs[k];
 }
 
-static void draw_top_right_date(const CornerCtx *c) {
+static void draw_top_right_date(const CornerCtx *c, bool date_only) {
   const int16_t pad = c->corner_pad;
   const int16_t h = (c->min_dim >= 200) ? scale_px(24, c->face_r) : scale_px(20, c->face_r);
   const GFont f_date = (c->min_dim >= 200) ? fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD)
@@ -811,8 +829,8 @@ static void draw_top_right_date(const CornerCtx *c) {
   const int cycle_sec = (c->ui_update_interval_sec == 10 || c->ui_update_interval_sec == 30 || c->ui_update_interval_sec == 60)
     ? c->ui_update_interval_sec
     : 5;
-  const bool show_weekday = weekday_buf[0] && (((time(NULL) / cycle_sec) % 2) != 0);
-  const char *detail = show_weekday ? weekday_buf : year_buf;
+  const bool show_weekday = !date_only && weekday_buf[0] && (((time(NULL) / cycle_sec) % 2) != 0);
+  const char *detail = date_only ? NULL : (show_weekday ? weekday_buf : year_buf);
 
   const int16_t detail_h = (c->min_dim >= 200) ? scale_px(20, c->face_r) : scale_px(18, c->face_r);
   const int16_t max_w = (int16_t)(c->bounds.size.w / 2 - pad);
@@ -1595,10 +1613,9 @@ void yes_draw_face(Layer *layer, GContext *ctx,
     draw_outer_scale(ctx, bounds, moon_inset, moon_up_thickness);
   }
 
-  // Moon phase disk: scale the full phase rendering (disk + crescent/shadow)
-  // with the expanded dial, not only the outline.
+  // Moon phase disk (original size; phase geometry fixed above).
   {
-    const int moon_r = minimal ? scale_px(14, face_r) : scale_px(9, face_r);
+    const int moon_r = scale_px(9, face_r);
     const GPoint moon_c = GPoint(c.x, (int16_t)(c.y + min_dim / 5));
     double phase = moon_phase_0_1(time(NULL)); // fallback
     if (have_phase) {
@@ -1607,7 +1624,7 @@ void yes_draw_face(Layer *layer, GContext *ctx,
       if (p > 1000000) p = 1000000;
       phase = (double)p / 1000000.0;
     }
-    draw_moon(ctx, moon_c, moon_r, phase);
+    draw_moon(ctx, moon_c, moon_r, phase, col_solar_night);
   }
 
   struct tm tm_loc;
@@ -1696,7 +1713,6 @@ void yes_draw_face(Layer *layer, GContext *ctx,
   }
 
   // Digital time: Normal/Minimalism only. Strict Minimalism hides it.
-  // Position remains slightly above the geometric center (independent of ring expansion).
   if (display_mode != YES_DISPLAY_MODE_STRICT_MINIMALISM) {
     char time_buf[12];
     clock_copy_time_string(time_buf, sizeof(time_buf));
@@ -1704,7 +1720,6 @@ void yes_draw_face(Layer *layer, GContext *ctx,
     const int16_t time_h = (min_dim >= 200) ? scale_px(34, face_r) : scale_px(28, face_r);
     int16_t y_center;
     if (minimal) {
-      // Fixed offset slightly above center so expansion of the dial does not push the time up.
       y_center = (int16_t)(c.y - scale_px(18, face_r));
     } else {
       const int16_t ring_center_r = (int16_t)(face_r - (int16_t)moon_inset);
@@ -1838,7 +1853,8 @@ void yes_draw_corners(Layer *layer, GContext *ctx,
     if (which >= 0) comps[which].draw(&cc);
   }
 
-  draw_top_right_date(&cc);
+  // Top-right: full date+year in Normal; month+day only in Minimalism.
+  draw_top_right_date(&cc, display_mode == YES_DISPLAY_MODE_MINIMALISM);
 
   // Bottom-left weather slot
   if (have_weather) {
