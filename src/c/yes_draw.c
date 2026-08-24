@@ -247,75 +247,29 @@ static int16_t isqrt16(int16_t n) {
   return x;
 }
 
-// Offset-circle moon: lit disk + shadow of the same (or slightly larger) radius.
-// offset = 0   → shadow covers the disk (new moon)
-// offset = 2r  → shadow is off the disk (full moon)
-static int16_t moon_shadow_offset(int radius, double phase) {
-  const double t = 1.0 - 2.0 * fabs(phase - 0.5); // 0 at new, 1 at full
-  int16_t d = (int16_t)lround(2.0 * (double)radius * t);
-  if (d < 0) d = 0;
-  if (d > 2 * radius) d = (int16_t)(2 * radius);
-  return d;
+// Orthographic spherical moon: terminator is an ellipse, not an equal-radius
+// circle. k = cos(angle from full): 1 at full, 0 at quarter, -1 at new.
+static int32_t moon_terminator_k_trig(double phase) {
+  double a = fabs(phase - 0.5);
+  if (a < 0) a = 0;
+  if (a > 0.5) a = 0.5;
+  const int32_t ang = (int32_t)lround(a * (double)TRIG_MAX_ANGLE);
+  return cos_lookup(ang);
 }
 
 #ifndef PBL_ROUND
 static int s_draw_min_dim;
 #endif
 
-static void draw_moon_fast(GContext *ctx, GPoint center, int radius, double phase, GColor shadow_col) {
-  const double eps = 0.015;
-  if (phase < 0) phase = 0;
-  if (phase > 1) phase = 1;
-  const int shadow_r = radius + 1;
-
-  graphics_context_set_stroke_width(ctx, 1);
-
-  if (phase < eps || phase > 1.0 - eps) {
-    graphics_context_set_fill_color(ctx, shadow_col);
-    graphics_fill_circle(ctx, center, radius);
-    graphics_context_set_stroke_color(ctx, GColorWhite);
-    graphics_draw_circle(ctx, center, radius);
-    return;
-  }
-  if (fabs(phase - 0.5) < eps) {
-    graphics_context_set_fill_color(ctx, GColorWhite);
-    graphics_fill_circle(ctx, center, radius);
-    graphics_context_set_stroke_color(ctx, GColorWhite);
-    graphics_draw_circle(ctx, center, radius);
-    return;
-  }
-
-  graphics_context_set_fill_color(ctx, GColorWhite);
-  graphics_fill_circle(ctx, center, radius);
-
-  const bool waxing = (phase < 0.5);
-  const int16_t offset = moon_shadow_offset(shadow_r, phase);
-  const GPoint shadow_c = GPoint((int16_t)(center.x + (waxing ? -offset : offset)), center.y);
-  graphics_context_set_fill_color(ctx, shadow_col);
-  graphics_fill_circle(ctx, shadow_c, shadow_r);
-  graphics_context_set_stroke_color(ctx, GColorWhite);
-  graphics_draw_circle(ctx, center, radius);
-}
-
 static void draw_moon(GContext *ctx, GPoint center, int radius, double phase, GColor shadow_col) {
-#ifndef PBL_ROUND
-  if (s_draw_min_dim >= 200) {
-    draw_moon_fast(ctx, center, radius, phase, shadow_col);
-    return;
-  }
-#endif
-  // Snap near endpoints so "full" and "new" look clean and don't show a stray terminator.
-  // Also, draw the terminator using scanlines so the shadow never paints outside the moon disk.
   const double eps = 0.015; // ~0.44 days
   if (phase < 0) phase = 0;
   if (phase > 1) phase = 1;
-
   if (radius <= 0) return;
 
   graphics_context_set_stroke_width(ctx, 1);
 
   if (phase < eps || phase > 1.0 - eps) {
-    // New moon: unlit disk with thin bright outline
     graphics_context_set_fill_color(ctx, shadow_col);
     graphics_fill_circle(ctx, center, radius);
     graphics_context_set_stroke_color(ctx, GColorWhite);
@@ -324,7 +278,6 @@ static void draw_moon(GContext *ctx, GPoint center, int radius, double phase, GC
   }
 
   if (fabs(phase - 0.5) < eps) {
-    // Full moon: bright disk
     graphics_context_set_fill_color(ctx, GColorWhite);
     graphics_fill_circle(ctx, center, radius);
     graphics_context_set_stroke_color(ctx, GColorWhite);
@@ -332,37 +285,36 @@ static void draw_moon(GContext *ctx, GPoint center, int radius, double phase, GC
     return;
   }
 
-  // White base disk
   graphics_context_set_fill_color(ctx, GColorWhite);
   graphics_fill_circle(ctx, center, radius);
 
-  // Shadow slightly larger than the disk so a 1px outline does not leave a white halo
-  // at the terminator. Offset 0 covers the disk (new), offset 2r leaves it (full).
-  const int shadow_r = radius + 1;
-  const int16_t offset = moon_shadow_offset(shadow_r, phase);
-  // Near-full: shadow is tangent/off the disk. Keep the white base.
-  if (offset >= (int16_t)(2 * shadow_r - 1)) {
-    graphics_context_set_stroke_color(ctx, GColorWhite);
-    graphics_draw_circle(ctx, center, radius);
-    return;
-  }
   const bool waxing = (phase < 0.5);
-  const int16_t dx = waxing ? (int16_t)(-offset) : offset;
+  const int32_t k_trig = moon_terminator_k_trig(phase);
+  const int16_t r = (int16_t)radius;
 
   graphics_context_set_stroke_color(ctx, shadow_col);
   graphics_context_set_stroke_width(ctx, 1);
 
-  const int16_t r = (int16_t)radius;
-  const int16_t rs = (int16_t)shadow_r;
   for (int16_t yy = -r; yy <= r; yy++) {
     const int16_t x_disk = isqrt16((int16_t)(r * r - yy * yy));
-    const int32_t sh2 = (int32_t)rs * (int32_t)rs - (int32_t)yy * (int32_t)yy;
-    const int16_t x_sh = (sh2 > 0) ? isqrt16((int16_t)sh2) : 0;
-    int16_t x1 = (int16_t)(dx - x_sh);
-    int16_t x2 = (int16_t)(dx + x_sh);
-    // Clip to the moon disk extents for this scanline.
+    if (x_disk <= 0) continue;
+    // x_term = ± k * x_disk. Dark is the left side when waxing (NH).
+    const int32_t xt = ((int32_t)k_trig * (int32_t)x_disk) / TRIG_MAX_RATIO;
+    int16_t x_term = waxing ? (int16_t)(-xt) : (int16_t)xt;
+    int16_t x1;
+    int16_t x2;
+    if (waxing) {
+      x1 = (int16_t)(-x_disk);
+      x2 = x_term;
+    } else {
+      x1 = x_term;
+      x2 = x_disk;
+    }
+    // 1px overlap so the terminator sits under the outline.
+    if (waxing) x2 = (int16_t)(x2 + 1);
+    else x1 = (int16_t)(x1 - 1);
     if (x1 < -x_disk) x1 = (int16_t)(-x_disk);
-    if (x2 >  x_disk) x2 = x_disk;
+    if (x2 > x_disk) x2 = x_disk;
     if (x1 <= x2) {
       const GPoint p0 = GPoint((int16_t)(center.x + x1), (int16_t)(center.y + yy));
       const GPoint p1 = GPoint((int16_t)(center.x + x2), (int16_t)(center.y + yy));
@@ -370,7 +322,6 @@ static void draw_moon(GContext *ctx, GPoint center, int radius, double phase, GC
     }
   }
 
-  // Thin outline (callers may have left a thick stroke from the moon-up ring)
   graphics_context_set_stroke_width(ctx, 1);
   graphics_context_set_stroke_color(ctx, GColorWhite);
   graphics_draw_circle(ctx, center, radius);
