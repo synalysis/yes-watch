@@ -84,6 +84,7 @@ enum {
   PERSIST_UI_UPDATE_INTERVAL_SEC = 141,
   PERSIST_LANGUAGE = 142,
   PERSIST_DISPLAY_MODE = 143,
+  PERSIST_TWILIGHT_MODE = 144,
 
   // Tides (US-only NOAA; phone sends data when a nearby station is within 50km)
   PERSIST_TIDE_HAVE = 150,
@@ -115,6 +116,7 @@ static bool s_use_internet_fallback;
 static int s_ui_update_interval_sec = 5;
 static int s_language = YES_LANG_EN;
 static int s_display_mode = YES_DISPLAY_MODE_NORMAL;
+static int s_twilight_mode = YES_TWILIGHT_MODE_NONE;
 
 static SunTimes s_sun_home;
 
@@ -391,6 +393,7 @@ static void inbox_received(DictionaryIterator *iter, void *context) {
   Tuple *t_ui_update_interval = dict_find(iter, MESSAGE_KEY_KEY_UI_UPDATE_INTERVAL_SEC);
   Tuple *t_language = dict_find(iter, MESSAGE_KEY_KEY_LANGUAGE);
   Tuple *t_display_mode = dict_find(iter, MESSAGE_KEY_KEY_DISPLAY_MODE);
+  Tuple *t_twilight_mode = dict_find(iter, MESSAGE_KEY_KEY_TWILIGHT_MODE);
 
   bool changed = false;
   bool canvas_changed = false;
@@ -451,6 +454,15 @@ static void inbox_received(DictionaryIterator *iter, void *context) {
       changed = true;
       canvas_changed = true;
       corner_changed = true;
+    }
+  }
+
+  if (t_twilight_mode) {
+    const int next_tw = yes_normalize_twilight_mode((int)t_twilight_mode->value->int32);
+    if (s_twilight_mode != next_tw) {
+      s_twilight_mode = next_tw;
+      persist_write_int(PERSIST_TWILIGHT_MODE, s_twilight_mode);
+      schedule_redraw(true, true);
     }
   }
 
@@ -829,6 +841,7 @@ static void canvas_update_proc(Layer *layer, GContext *ctx) {
                 s_have_moon_phase,
                 s_moon_phase_e6,
                 s_display_mode,
+                s_twilight_mode,
                 active_loc(),
                 active_sun(),
                 active_moon());
@@ -958,6 +971,9 @@ static void prv_init(void) {
   s_display_mode = persist_exists(PERSIST_DISPLAY_MODE)
     ? yes_normalize_display_mode(persist_read_int(PERSIST_DISPLAY_MODE))
     : YES_DISPLAY_MODE_NORMAL;
+  s_twilight_mode = persist_exists(PERSIST_TWILIGHT_MODE)
+    ? yes_normalize_twilight_mode(persist_read_int(PERSIST_TWILIGHT_MODE))
+    : YES_TWILIGHT_MODE_NONE;
   s_last_calc_year = s_last_calc_month = s_last_calc_day = -1;
   clear_events();
   s_have_moon_phase = false;

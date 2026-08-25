@@ -41,6 +41,7 @@ void yes_draw_face(Layer *layer, GContext *ctx,
                      bool have_phase,
                      int32_t moon_phase_e6,
                      int display_mode,
+                     int twilight_mode,
                      const GeoLoc *loc,
                      const SunTimes *sun,
                      const MoonTimes *moon);

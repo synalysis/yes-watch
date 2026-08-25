@@ -68,6 +68,7 @@ The phone companion provides a simple config page:
 - **Units**: metric (Celsius, km/h) or imperial (Fahrenheit, mph), defaulting from the existing location heuristic
 - **Corner update cycle**: 5s, 10s, 30s, or 60s
 - **Display mode**: Normal, Minimalism, or Strict Minimalism
+- **Golden/Blue Hour**: None, Lined (dashed spokes from the hand hub), or Full (filled wedges)
 
 ## Code layout
 

@@ -50,7 +50,8 @@ const KEYS = {
   USE_INTERNET_FALLBACK: 'KEY_USE_INTERNET_FALLBACK',
   UI_UPDATE_INTERVAL_SEC: 'KEY_UI_UPDATE_INTERVAL_SEC',
   LANGUAGE: 'KEY_LANGUAGE',
-  DISPLAY_MODE: 'KEY_DISPLAY_MODE'
+  DISPLAY_MODE: 'KEY_DISPLAY_MODE',
+  TWILIGHT_MODE: 'KEY_TWILIGHT_MODE'
 };
 
 function log() {
@@ -606,6 +607,26 @@ function sendDisplayMode() {
   sendQueued(payload);
 }
 
+
+function normalizeTwilightMode(v) {
+  const n = parseInt(v, 10);
+  if (n === 1 || n === 2) return n;
+  return 0;
+}
+
+function readTwilightModeFromStorage() {
+  try {
+    return normalizeTwilightMode(localStorage.getItem('twilightMode'));
+  } catch (e) {
+    return 0;
+  }
+}
+
+function sendTwilightMode() {
+  const payload = {};
+  payload[KEYS.TWILIGHT_MODE] = readTwilightModeFromStorage();
+  sendQueued(payload);
+}
 
 function sendAltitudeUnitForLocation(latE6, lonE6) {
   const payload = {};
@@ -1473,7 +1494,12 @@ const CONFIG_I18N = {
     displayNormal: 'Normal',
     displayMinimalism: 'Minimalism',
     displayStrict: 'Strict Minimalism',
-    displayModeHint: 'Minimalism removes the hour scale and expands the dial. Strict Minimalism also hides corner data and the digital time.'
+    displayModeHint: 'Minimalism removes the hour scale and expands the dial. Strict Minimalism also hides corner data and the digital time.',
+    twilightMode: 'Display Golden/Blue Hour',
+    twilightNone: 'None',
+    twilightLined: 'Lined',
+    twilightFull: 'Full',
+    twilightModeHint: 'Dashed spokes or filled wedges around sunrise and sunset for blue and golden hour.'
   },
   de: {
     title: 'YES Watchface Einstellungen',
@@ -1496,7 +1522,12 @@ const CONFIG_I18N = {
     displayNormal: 'Normal',
     displayMinimalism: 'Minimalismus',
     displayStrict: 'Strenger Minimalismus',
-    displayModeHint: 'Minimalismus entfernt die Stundenskala und vergrößert den Kreis. Strenger Minimalismus blendet zusätzlich Ecken und digitale Uhrzeit aus.'
+    displayModeHint: 'Minimalismus entfernt die Stundenskala und vergrößert den Kreis. Strenger Minimalismus blendet zusätzlich Ecken und digitale Uhrzeit aus.',
+    twilightMode: 'Goldene/Blaue Stunde',
+    twilightNone: 'Aus',
+    twilightLined: 'Linien',
+    twilightFull: 'Voll',
+    twilightModeHint: 'Gestrichelte Speichen oder ausgefüllte Keile um Auf- und Untergang für blaue und goldene Stunde.'
   },
   fr: {
     title: 'Paramètres YES Watchface',
@@ -1519,7 +1550,12 @@ const CONFIG_I18N = {
     displayNormal: 'Normal',
     displayMinimalism: 'Minimalisme',
     displayStrict: 'Minimalisme strict',
-    displayModeHint: 'Le minimalisme retire l\'échelle horaire et agrandit le cadran. Le minimalisme strict masque aussi les coins et l\'heure numérique.'
+    displayModeHint: 'Le minimalisme retire l\'échelle horaire et agrandit le cadran. Le minimalisme strict masque aussi les coins et l\'heure numérique.',
+    twilightMode: 'Heure dorée/bleue',
+    twilightNone: 'Aucun',
+    twilightLined: 'Lignes',
+    twilightFull: 'Plein',
+    twilightModeHint: 'Rayons pointillés ou secteurs pleins autour du lever et du coucher pour l\'heure bleue et dorée.'
   },
   es: {
     title: 'Ajustes de YES Watchface',
@@ -1542,7 +1578,12 @@ const CONFIG_I18N = {
     displayNormal: 'Normal',
     displayMinimalism: 'Minimalismo',
     displayStrict: 'Minimalismo estricto',
-    displayModeHint: 'El minimalismo quita la escala horaria y amplía el círculo. El minimalismo estricto también oculta las esquinas y la hora digital.'
+    displayModeHint: 'El minimalismo quita la escala horaria y amplía el círculo. El minimalismo estricto también oculta las esquinas y la hora digital.',
+    twilightMode: 'Hora dorada/azul',
+    twilightNone: 'Ninguno',
+    twilightLined: 'Líneas',
+    twilightFull: 'Lleno',
+    twilightModeHint: 'Radios discontinuos o sectores rellenos alrededor del amanecer y el atardecer.'
   },
   pt: {
     title: 'Definições YES Watchface',
@@ -1565,7 +1606,12 @@ const CONFIG_I18N = {
     displayNormal: 'Normal',
     displayMinimalism: 'Minimalismo',
     displayStrict: 'Minimalismo estrito',
-    displayModeHint: 'O minimalismo remove a escala horária e amplia o círculo. O minimalismo estrito também oculta os cantos e a hora digital.'
+    displayModeHint: 'O minimalismo remove a escala horária e amplia o círculo. O minimalismo estrito também oculta os cantos e a hora digital.',
+    twilightMode: 'Hora dourada/azul',
+    twilightNone: 'Nenhum',
+    twilightLined: 'Linhas',
+    twilightFull: 'Cheio',
+    twilightModeHint: 'Raios tracejados ou setores preenchidos ao nascer e pôr do sol.'
   },
   it: {
     title: 'Impostazioni YES Watchface',
@@ -1588,7 +1634,12 @@ const CONFIG_I18N = {
     displayNormal: 'Normale',
     displayMinimalism: 'Minimalismo',
     displayStrict: 'Minimalismo rigoroso',
-    displayModeHint: 'Il minimalismo rimuove la scala oraria e allarga il quadrante. Il minimalismo rigoroso nasconde anche gli angoli e l\'ora digitale.'
+    displayModeHint: 'Il minimalismo rimuove la scala oraria e allarga il quadrante. Il minimalismo rigoroso nasconde anche gli angoli e l\'ora digitale.',
+    twilightMode: 'Ora dorata/blu',
+    twilightNone: 'Nessuno',
+    twilightLined: 'Linee',
+    twilightFull: 'Pieno',
+    twilightModeHint: 'Raggi tratteggiati o settori pieni intorno a alba e tramonto.'
   }
 };
 
@@ -1603,9 +1654,10 @@ function getUiModelFromStorage() {
   const uiUpdateIntervalSec = readUpdateIntervalSecFromStorage();
   const language = readLanguageFromStorage();
   const displayMode = readDisplayModeFromStorage();
+  const twilightMode = readTwilightModeFromStorage();
   const locationDisplay = getLocationDisplayForConfig();
 
-  return { useInternet, unitsMode, uiUpdateIntervalSec, language, displayMode, locationDisplay };
+  return { useInternet, unitsMode, uiUpdateIntervalSec, language, displayMode, twilightMode, locationDisplay };
 }
 
 function configLanguageOptionsHtml() {
@@ -1615,7 +1667,7 @@ function configLanguageOptionsHtml() {
   }).join('\n      ');
 }
 
-function configHtml(useInternet, unitsMode, uiUpdateIntervalSec, language, displayMode, locationDisplay) {
+function configHtml(useInternet, unitsMode, uiUpdateIntervalSec, language, displayMode, twilightMode, locationDisplay) {
   // Inline config page.
   // IMPORTANT: localStorage is disabled for `data:` URLs in many browsers, so do NOT access it here.
   // We inject initial values from pkjs instead and return the user's changes via return_to/pebblejs://close.
@@ -1682,6 +1734,13 @@ function configHtml(useInternet, unitsMode, uiUpdateIntervalSec, language, displ
       <option value="2">${L.displayStrict}</option>
     </select>
     <div class="hint">${L.displayModeHint}</div>
+    <label>${L.twilightMode}</label>
+    <select id="twilightMode">
+      <option value="0">${L.twilightNone}</option>
+      <option value="1">${L.twilightLined}</option>
+      <option value="2">${L.twilightFull}</option>
+    </select>
+    <div class="hint">${L.twilightModeHint}</div>
   </div>
   <button id="save">${L.save}</button>
 
@@ -1691,6 +1750,7 @@ function configHtml(useInternet, unitsMode, uiUpdateIntervalSec, language, displ
     const INITIAL_UI_UPDATE_INTERVAL_SEC = ${JSON.stringify(normalizeUpdateIntervalSec(uiUpdateIntervalSec))};
     const INITIAL_LANGUAGE = ${JSON.stringify(languageCode)};
     const INITIAL_DISPLAY_MODE = ${JSON.stringify(normalizeDisplayMode(displayMode))};
+    const INITIAL_TWILIGHT_MODE = ${JSON.stringify(normalizeTwilightMode(twilightMode))};
 
     function closeWith(payload) {
       const encoded = encodeURIComponent(JSON.stringify(payload));
@@ -1715,6 +1775,7 @@ function configHtml(useInternet, unitsMode, uiUpdateIntervalSec, language, displ
         document.getElementById('uiUpdateIntervalSec').value = String(INITIAL_UI_UPDATE_INTERVAL_SEC);
         document.getElementById('language').value = INITIAL_LANGUAGE;
         document.getElementById('displayMode').value = String(INITIAL_DISPLAY_MODE);
+        document.getElementById('twilightMode').value = String(INITIAL_TWILIGHT_MODE);
       } catch (e) {}
     }
 
@@ -1724,12 +1785,14 @@ function configHtml(useInternet, unitsMode, uiUpdateIntervalSec, language, displ
       const uiUpdateIntervalSec = parseInt(document.getElementById('uiUpdateIntervalSec').value, 10);
       const language = document.getElementById('language').value;
       const displayMode = parseInt(document.getElementById('displayMode').value, 10);
+      const twilightMode = parseInt(document.getElementById('twilightMode').value, 10);
       closeWith({
         useInternet: !!useInternet,
         unitsMode: unitsMode,
         uiUpdateIntervalSec: uiUpdateIntervalSec,
         language: language,
-        displayMode: displayMode
+        displayMode: displayMode,
+        twilightMode: twilightMode
       });
     }
 
@@ -1751,6 +1814,7 @@ Pebble.addEventListener('ready', () => {
   sendUseInternetFlag();
   sendUiUpdateInterval();
   sendDisplayMode();
+  sendTwilightMode();
   setInterval(maybeRefreshLocation, 10 * 60 * 1000);
 
   // Re-send astro data periodically (handles date rollovers even if GPS doesn't change)
@@ -1778,7 +1842,7 @@ Pebble.addEventListener('showConfiguration', () => {
   const ui = getUiModelFromStorage();
   sendLanguage();
   const url = 'data:text/html;charset=utf-8,' + encodeURIComponent(
-    configHtml(ui.useInternet, ui.unitsMode, ui.uiUpdateIntervalSec, ui.language, ui.displayMode, ui.locationDisplay)
+    configHtml(ui.useInternet, ui.unitsMode, ui.uiUpdateIntervalSec, ui.language, ui.displayMode, ui.twilightMode, ui.locationDisplay)
   );
   Pebble.openURL(url);
 });
@@ -1819,6 +1883,15 @@ Pebble.addEventListener('webviewclosed', (e) => {
       localStorage.setItem('displayMode', String(nextMode));
       if (prevMode !== nextMode) {
         sendDisplayMode();
+  sendTwilightMode();
+      }
+    }
+    if (payload && typeof payload.twilightMode !== 'undefined') {
+      const prevTw = readTwilightModeFromStorage();
+      const nextTw = normalizeTwilightMode(payload.twilightMode);
+      localStorage.setItem('twilightMode', String(nextTw));
+      if (prevTw !== nextTw) {
+        sendTwilightMode();
       }
     }
   } catch (err) {

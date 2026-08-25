@@ -38,3 +38,17 @@ static inline int yes_normalize_display_mode(int mode) {
   }
   return YES_DISPLAY_MODE_NORMAL;
 }
+
+// Golden / blue hour visualization
+enum {
+  YES_TWILIGHT_MODE_NONE = 0,
+  YES_TWILIGHT_MODE_LINED = 1,
+  YES_TWILIGHT_MODE_FULL = 2
+};
+
+static inline int yes_normalize_twilight_mode(int mode) {
+  if (mode == YES_TWILIGHT_MODE_LINED || mode == YES_TWILIGHT_MODE_FULL) {
+    return mode;
+  }
+  return YES_TWILIGHT_MODE_NONE;
+}

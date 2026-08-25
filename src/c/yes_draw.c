@@ -17,6 +17,8 @@
 // Reusable path for the 24h hand (tapered arrow)
 static GPath *s_hand_path;
 static GPoint s_hand_points[5];
+static GPath *s_hand_half_path;
+static GPoint s_hand_half_points[4];
 
 // Scale a "baseline Basalt" pixel value (for 144x168 => face_r ~72) to current face radius.
 static int16_t scale_px(int16_t base_px, int16_t face_r) {
@@ -37,12 +39,23 @@ void yes_draw_init(void) {
     };
     s_hand_path = gpath_create(&hand_info);
   }
+  if (!s_hand_half_path) {
+    const GPathInfo half_info = {
+      .num_points = 4,
+      .points = s_hand_half_points,
+    };
+    s_hand_half_path = gpath_create(&half_info);
+  }
 }
 
 void yes_draw_deinit(void) {
   if (s_hand_path) {
     gpath_destroy(s_hand_path);
     s_hand_path = NULL;
+  }
+  if (s_hand_half_path) {
+    gpath_destroy(s_hand_half_path);
+    s_hand_half_path = NULL;
   }
 }
 
@@ -102,6 +115,97 @@ static void fill_radial_wedge(GContext *ctx, GRect bounds, uint16_t inset,
   } else {
     graphics_fill_radial(ctx, disk_rect, GOvalScaleModeFitCircle, thickness, s, TRIG_MAX_ANGLE);
     graphics_fill_radial(ctx, disk_rect, GOvalScaleModeFitCircle, thickness, 0, e);
+  }
+}
+
+// Dashed radial fan (spokes) between two angles — used for blue/golden hour bands.
+// Draws alternating short radial ticks from outer rim inward, clipped to the solar disk.
+static void draw_dashed_fan(GContext *ctx, GPoint center, int16_t r_outer, int16_t r_inner,
+                            int32_t start_angle, int32_t end_angle, GColor color) {
+  if (r_outer <= r_inner + 2) return;
+  int32_t s = start_angle % TRIG_MAX_ANGLE;
+  int32_t e = end_angle % TRIG_MAX_ANGLE;
+  if (s < 0) s += TRIG_MAX_ANGLE;
+  if (e < 0) e += TRIG_MAX_ANGLE;
+  int32_t span = e - s;
+  if (span < 0) span += TRIG_MAX_ANGLE;
+  if (span <= 0) return;
+
+  // ~1 spoke per ~2.5° of the 24h circle; clamp for short bands.
+  int n = (int)(span / (TRIG_MAX_ANGLE / 144));
+  if (n < 3) n = 3;
+  if (n > 48) n = 48;
+
+  graphics_context_set_stroke_color(ctx, color);
+  graphics_context_set_stroke_width(ctx, 1);
+
+  for (int i = 0; i <= n; i++) {
+    // Dash pattern: draw every other spoke for a dashed look.
+    if ((i & 1) != 0) continue;
+    const int32_t a = (s + (int32_t)((int64_t)span * i / n)) % TRIG_MAX_ANGLE;
+    const int16_t x0 = (int16_t)(center.x + (int32_t)sin_lookup(a) * r_inner / TRIG_MAX_RATIO);
+    const int16_t y0 = (int16_t)(center.y - (int32_t)cos_lookup(a) * r_inner / TRIG_MAX_RATIO);
+    const int16_t x1 = (int16_t)(center.x + (int32_t)sin_lookup(a) * r_outer / TRIG_MAX_RATIO);
+    const int16_t y1 = (int16_t)(center.y - (int32_t)cos_lookup(a) * r_outer / TRIG_MAX_RATIO);
+    graphics_draw_line(ctx, GPoint(x0, y0), GPoint(x1, y1));
+  }
+}
+
+// Approximate blue/golden hour bands from sunrise/sunset (mid-latitude offsets).
+// Blue ~35 min of civil twilight; golden ~50 min after rise / before set.
+// mode: NONE (skip), LINED (dashed spokes from hub), FULL (filled wedges).
+static void draw_twilight_bands(GContext *ctx, GRect bounds, uint16_t night_inset,
+                                GPoint center, int16_t solar_r, int16_t hub_r,
+                                int sunrise_min, int sunset_min, int twilight_mode) {
+  if (twilight_mode == YES_TWILIGHT_MODE_NONE) return;
+  if (solar_r < 12) return;
+  const int BLUE_MIN = 35;
+  const int GOLD_MIN = 50;
+  const int16_t r_outer = solar_r;
+  // Start at the hand hub so fans meet the pointer base.
+  const int16_t r_inner = (hub_r > 0) ? hub_r : scale_px(6, solar_r);
+
+#ifdef PBL_COLOR
+  // Full wedges: bright palette. Lined spokes: darker (dark red / deep blue).
+  const GColor col_blue_full = GColorVividCerulean;
+  const GColor col_gold_full = GColorYellow;
+  const GColor col_blue_lined = GColorVividCerulean;
+  const GColor col_gold_lined = GColorDarkCandyAppleRed;
+#else
+  const GColor col_blue_full = GColorLightGray;
+  const GColor col_gold_full = GColorWhite;
+  const GColor col_blue_lined = GColorDarkGray;
+  const GColor col_gold_lined = GColorDarkGray;
+#endif
+
+  const int bands_a0[4] = {
+    (sunrise_min - BLUE_MIN + 1440) % 1440,
+    sunrise_min % 1440,
+    (sunset_min - GOLD_MIN + 1440) % 1440,
+    sunset_min % 1440
+  };
+  const int bands_a1[4] = {
+    sunrise_min % 1440,
+    (sunrise_min + GOLD_MIN) % 1440,
+    sunset_min % 1440,
+    (sunset_min + BLUE_MIN) % 1440
+  };
+  const bool lined = (twilight_mode != YES_TWILIGHT_MODE_FULL);
+  const GColor bands_col[4] = {
+    lined ? col_blue_lined : col_blue_full,
+    lined ? col_gold_lined : col_gold_full,
+    lined ? col_gold_lined : col_gold_full,
+    lined ? col_blue_lined : col_blue_full
+  };
+
+  for (int i = 0; i < 4; i++) {
+    const int32_t a0 = angle_from_local_minutes_24h(bands_a0[i]);
+    const int32_t a1 = angle_from_local_minutes_24h(bands_a1[i]);
+    if (twilight_mode == YES_TWILIGHT_MODE_FULL) {
+      fill_radial_wedge(ctx, bounds, night_inset, a0, a1, bands_col[i]);
+    } else {
+      draw_dashed_fan(ctx, center, r_outer, r_inner, a0, a1, bands_col[i]);
+    }
   }
 }
 
@@ -1291,6 +1395,7 @@ void yes_draw_face(Layer *layer, GContext *ctx,
                      bool have_phase,
                      int32_t moon_phase_e6,
                      int display_mode,
+                     int twilight_mode,
                      const GeoLoc *loc,
                      const SunTimes *sun_times,
                      const MoonTimes *moon_times) {
@@ -1566,6 +1671,13 @@ void yes_draw_face(Layer *layer, GContext *ctx,
       const int32_t a_sunset  = angle_from_local_minutes_24h(sun_times->sunset_min);
       fill_radial_wedge(ctx, bounds, night_inset, a_sunrise, a_sunset, col_solar_day);
       top_is_night = !angle_in_sweep(0, a_sunrise, a_sunset);
+      // Blue/golden hour bands (None / Lined / Full).
+      {
+        const int16_t solar_r_tw = (int16_t)(MIN(bounds.size.w, bounds.size.h) / 2 - solar_inset);
+        const int16_t hub_r = scale_px(6, face_r);
+        draw_twilight_bands(ctx, bounds, night_inset, c, solar_r_tw, hub_r,
+                            sun_times->sunrise_min, sun_times->sunset_min, twilight_mode);
+      }
     }
   }
 
@@ -1647,8 +1759,25 @@ void yes_draw_face(Layer *layer, GContext *ctx,
     s_hand_path->rotation = 0;
     s_hand_path->offset = GPoint(0, 0);
 
+    // Longitudinal split: full white base, then dark half on top (no 1px seam gap).
     graphics_context_set_fill_color(ctx, GColorWhite);
     gpath_draw_filled(ctx, s_hand_path);
+    if (s_hand_half_path) {
+      // Dark half includes the centerline (base→tip) so it seals any fill gap.
+      s_hand_half_points[0] = GPoint(base.x - bdx, base.y - bdy);
+      s_hand_half_points[1] = base;
+      s_hand_half_points[2] = tip;
+      s_hand_half_points[3] = GPoint(neck.x - ndx, neck.y - ndy);
+      s_hand_half_path->num_points = 4;
+      s_hand_half_path->rotation = 0;
+      s_hand_half_path->offset = GPoint(0, 0);
+      graphics_context_set_fill_color(ctx, GColorDarkGray);
+      gpath_draw_filled(ctx, s_hand_half_path);
+      // 1px centerline seals residual gaps from integer vertex rounding.
+      graphics_context_set_stroke_color(ctx, GColorDarkGray);
+      graphics_context_set_stroke_width(ctx, 1);
+      graphics_draw_line(ctx, base, tip);
+    }
     graphics_context_set_stroke_color(ctx, outline);
     graphics_context_set_stroke_width(ctx, 1);
     gpath_draw_outline(ctx, s_hand_path);
@@ -1656,18 +1785,38 @@ void yes_draw_face(Layer *layer, GContext *ctx,
     const int16_t hub_r = scale_px(6, face_r);
     graphics_context_set_fill_color(ctx, GColorWhite);
     graphics_fill_circle(ctx, c, hub_r);
+    // Dark half of hub on the -perp side
+    if (s_hand_half_path) {
+      const int16_t hx = (int16_t)((int32_t)(-px) * hub_r / TRIG_MAX_RATIO);
+      const int16_t hy = (int16_t)((int32_t)(-py) * hub_r / TRIG_MAX_RATIO);
+      s_hand_half_points[0] = c;
+      s_hand_half_points[1] = GPoint((int16_t)(c.x + hx + (int32_t)(-uy) * hub_r / TRIG_MAX_RATIO / 2),
+                                      (int16_t)(c.y + hy + (int32_t)(ux) * hub_r / TRIG_MAX_RATIO / 2));
+      s_hand_half_points[2] = GPoint((int16_t)(c.x + hx), (int16_t)(c.y + hy));
+      s_hand_half_points[3] = GPoint((int16_t)(c.x + hx + (int32_t)(uy) * hub_r / TRIG_MAX_RATIO / 2),
+                                      (int16_t)(c.y + hy + (int32_t)(-ux) * hub_r / TRIG_MAX_RATIO / 2));
+      // Simpler: small dark circle offset toward -perp
+      graphics_context_set_fill_color(ctx, GColorDarkGray);
+      graphics_fill_circle(ctx,
+        GPoint((int16_t)(c.x - (int32_t)px * hub_r / 3 / TRIG_MAX_RATIO),
+               (int16_t)(c.y - (int32_t)py * hub_r / 3 / TRIG_MAX_RATIO)),
+        (int16_t)(hub_r * 2 / 3));
+    }
     graphics_context_set_stroke_color(ctx, outline);
     graphics_draw_circle(ctx, c, hub_r);
   } else {
     const int16_t x = c.x + (int16_t)((int32_t)sin_lookup(hand_angle) * hand_len / TRIG_MAX_RATIO);
     const int16_t y = c.y - (int16_t)((int32_t)cos_lookup(hand_angle) * hand_len / TRIG_MAX_RATIO);
-    graphics_context_set_stroke_color(ctx, GColorWhite);
-#ifdef PBL_COLOR
-    graphics_context_set_stroke_width(ctx, 3);
-#else
+    const int32_t pxx = cos_lookup(hand_angle);
+    const int32_t pyy = sin_lookup(hand_angle);
+    const int16_t ox = (int16_t)((int32_t)pxx * 1 / TRIG_MAX_RATIO);
+    const int16_t oy = (int16_t)((int32_t)pyy * 1 / TRIG_MAX_RATIO);
+    // White + dark parallel lines ≈ split shaft
     graphics_context_set_stroke_width(ctx, 2);
-#endif
-    graphics_draw_line(ctx, c, GPoint(x, y));
+    graphics_context_set_stroke_color(ctx, GColorWhite);
+    graphics_draw_line(ctx, GPoint((int16_t)(c.x + ox), (int16_t)(c.y + oy)), GPoint((int16_t)(x + ox), (int16_t)(y + oy)));
+    graphics_context_set_stroke_color(ctx, GColorDarkGray);
+    graphics_draw_line(ctx, GPoint((int16_t)(c.x - ox), (int16_t)(c.y - oy)), GPoint((int16_t)(x - ox), (int16_t)(y - oy)));
     graphics_context_set_fill_color(ctx, GColorWhite);
     graphics_fill_circle(ctx, c, scale_px(4, face_r));
   }

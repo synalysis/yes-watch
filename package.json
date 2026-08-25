@@ -68,7 +68,8 @@
       "KEY_USE_INTERNET_FALLBACK",
       "KEY_UI_UPDATE_INTERVAL_SEC",
       "KEY_LANGUAGE",
-      "KEY_DISPLAY_MODE"
+      "KEY_DISPLAY_MODE",
+      "KEY_TWILIGHT_MODE"
     ],
     "resources": {
       "media": []
