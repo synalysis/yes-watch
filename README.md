@@ -14,6 +14,7 @@ The project is designed to run well on both **color** and **black/white** Pebble
 - **Moon ring** showing “moon up” interval
 - **Moon phase disk** (with smoothing near full/new so it looks clean)
 - **Loading screen** until valid location + astro data are available
+- **Display modes**: Normal, Minimalism (no hour scale/labels; expanded dial; digital time and corners remain), Strict Minimalism (as Minimalism, but without digital time and corner complications)
 
 ## Build
 
@@ -66,6 +67,8 @@ The phone companion provides a simple config page:
 - “**Use Internet (MET Norway) for rise/set**” (preferred; falls back to local computation on failure)
 - **Units**: metric (Celsius, km/h) or imperial (Fahrenheit, mph), defaulting from the existing location heuristic
 - **Corner update cycle**: 5s, 10s, 30s, or 60s
+- **Display mode**: Normal, Minimalism, or Strict Minimalism
+- **Golden/Blue Hour**: None, Lined (dashed spokes from the hand hub), or Full (filled wedges)
 
 ## Code layout
 
