@@ -10,6 +10,9 @@
 void yes_draw_init(void);
 void yes_draw_deinit(void);
 
+// Drop cached static face bitmap (call when sun/moon/loc/phase changes).
+void yes_draw_invalidate_face_cache(void);
+
 // Draw the full watchface (including the loading screen). Intended for the main layer.
 void yes_draw_face(Layer *layer, GContext *ctx,
                      bool debug,

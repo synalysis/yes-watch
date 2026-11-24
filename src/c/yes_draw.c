@@ -20,6 +20,13 @@ static GPoint s_hand_points[5];
 static GPath *s_hand_half_path;
 static GPoint s_hand_half_points[4];
 
+// Cached static face (rings/wedge/moon) for large displays; hand/time drawn on top each minute.
+static GBitmap *s_face_cache;
+static bool s_face_cache_valid;
+static int s_face_cache_min_dim;
+static int s_face_cache_display_mode = -1;
+static int s_face_cache_twilight_mode = -1;
+
 // Scale a "baseline Basalt" pixel value (for 144x168 => face_r ~72) to current face radius.
 static int16_t scale_px(int16_t base_px, int16_t face_r) {
   const int16_t BASE_R = 72;
@@ -49,6 +56,7 @@ void yes_draw_init(void) {
 }
 
 void yes_draw_deinit(void) {
+  yes_draw_invalidate_face_cache();
   if (s_hand_path) {
     gpath_destroy(s_hand_path);
     s_hand_path = NULL;
@@ -57,6 +65,37 @@ void yes_draw_deinit(void) {
     gpath_destroy(s_hand_half_path);
     s_hand_half_path = NULL;
   }
+}
+
+void yes_draw_invalidate_face_cache(void) {
+  if (s_face_cache) {
+    gbitmap_destroy(s_face_cache);
+    s_face_cache = NULL;
+  }
+  s_face_cache_valid = false;
+  s_face_cache_min_dim = 0;
+  s_face_cache_display_mode = -1;
+  s_face_cache_twilight_mode = -1;
+}
+
+// Framebuffer capture returns live display memory; copy before release for persistent cache.
+static GBitmap *copy_gbitmap(const GBitmap *src) {
+  if (!src) return NULL;
+  const GRect bounds = gbitmap_get_bounds(src);
+  const GSize size = bounds.size;
+  if (size.w <= 0 || size.h <= 0) return NULL;
+  const GBitmapFormat fmt = gbitmap_get_format(src);
+  GBitmap *copy = gbitmap_create_blank(size, fmt);
+  if (!copy) return NULL;
+  for (uint16_t y = 0; y < (uint16_t)size.h; y++) {
+    const GBitmapDataRowInfo srow = gbitmap_get_data_row_info(src, y);
+    const GBitmapDataRowInfo drow = gbitmap_get_data_row_info(copy, y);
+    const size_t nbytes = (size_t)(srow.max_x - srow.min_x + 1);
+    if (nbytes > 0) {
+      memcpy(drow.data, srow.data, nbytes);
+    }
+  }
+  return copy;
 }
 
 static int32_t angle_from_local_minutes_24h(int minutes_since_midnight) {
@@ -1365,6 +1404,155 @@ static void wx_draw_pressure(const CornerCtx *c) {
 }
 #endif
 
+static void draw_hand_and_time(GContext *ctx, const GRect bounds, const GPoint c,
+                               int16_t face_r, int min_dim, uint16_t moon_inset,
+                               uint16_t moon_up_thickness, uint16_t solar_inset,
+                               bool top_is_night, int display_mode, bool minimal,
+                               const GeoLoc *loc) {
+  struct tm tm_loc;
+  int minutes = 0;
+  if (!yes_local_tm_now(loc, &tm_loc, &minutes)) minutes = 0;
+
+  const int32_t hand_angle = angle_from_local_minutes_24h(minutes);
+  const int16_t solar_r = (int16_t)(face_r - (int16_t)solar_inset - scale_px(2, face_r));
+  const int16_t hand_margin = minimal ? scale_px(12, face_r) : scale_px(18, face_r);
+  const int16_t hand_len = (int16_t)MIN(solar_r, (int16_t)(face_r - hand_margin));
+
+  if (s_hand_path && hand_len > 16) {
+    const int32_t ux = sin_lookup(hand_angle);
+    const int32_t uy = -cos_lookup(hand_angle);
+    const int32_t px = cos_lookup(hand_angle);
+    const int32_t py = sin_lookup(hand_angle);
+
+    const int16_t base_r = scale_px(4, face_r);
+    const int16_t head_len = scale_px(10, face_r);
+    int16_t neck_r = (int16_t)(hand_len - head_len);
+    if (neck_r < (int16_t)(base_r + scale_px(4, face_r))) neck_r = (int16_t)(base_r + scale_px(4, face_r));
+    const int16_t tip_r  = hand_len;
+
+#ifdef PBL_COLOR
+    const int16_t base_w = scale_px(9, face_r);
+    const int16_t neck_w = scale_px(5, face_r);
+    const GColor outline = GColorDarkGray;
+#else
+    const int16_t base_w = scale_px(7, face_r);
+    const int16_t neck_w = scale_px(4, face_r);
+    const GColor outline = GColorBlack;
+#endif
+
+    const GPoint base = (GPoint){
+      .x = (int16_t)(c.x + (int32_t)ux * base_r / TRIG_MAX_RATIO),
+      .y = (int16_t)(c.y + (int32_t)uy * base_r / TRIG_MAX_RATIO),
+    };
+    const GPoint neck = (GPoint){
+      .x = (int16_t)(c.x + (int32_t)ux * neck_r / TRIG_MAX_RATIO),
+      .y = (int16_t)(c.y + (int32_t)uy * neck_r / TRIG_MAX_RATIO),
+    };
+    const GPoint tip = (GPoint){
+      .x = (int16_t)(c.x + (int32_t)ux * tip_r / TRIG_MAX_RATIO),
+      .y = (int16_t)(c.y + (int32_t)uy * tip_r / TRIG_MAX_RATIO),
+    };
+
+    const int16_t bdx = (int16_t)((int32_t)px * (base_w / 2) / TRIG_MAX_RATIO);
+    const int16_t bdy = (int16_t)((int32_t)py * (base_w / 2) / TRIG_MAX_RATIO);
+    const int16_t ndx = (int16_t)((int32_t)px * (neck_w / 2) / TRIG_MAX_RATIO);
+    const int16_t ndy = (int16_t)((int32_t)py * (neck_w / 2) / TRIG_MAX_RATIO);
+
+    s_hand_points[0] = GPoint(base.x + bdx, base.y + bdy);
+    s_hand_points[1] = GPoint(neck.x + ndx, neck.y + ndy);
+    s_hand_points[2] = tip;
+    s_hand_points[3] = GPoint(neck.x - ndx, neck.y - ndy);
+    s_hand_points[4] = GPoint(base.x - bdx, base.y - bdy);
+
+    s_hand_path->num_points = (uint32_t)(sizeof(s_hand_points) / sizeof(s_hand_points[0]));
+    s_hand_path->rotation = 0;
+    s_hand_path->offset = GPoint(0, 0);
+
+    graphics_context_set_fill_color(ctx, GColorWhite);
+    gpath_draw_filled(ctx, s_hand_path);
+    if (s_hand_half_path) {
+      s_hand_half_points[0] = GPoint(base.x - bdx, base.y - bdy);
+      s_hand_half_points[1] = base;
+      s_hand_half_points[2] = tip;
+      s_hand_half_points[3] = GPoint(neck.x - ndx, neck.y - ndy);
+      s_hand_half_path->num_points = 4;
+      s_hand_half_path->rotation = 0;
+      s_hand_half_path->offset = GPoint(0, 0);
+      graphics_context_set_fill_color(ctx, GColorDarkGray);
+      gpath_draw_filled(ctx, s_hand_half_path);
+      graphics_context_set_stroke_color(ctx, GColorDarkGray);
+      graphics_context_set_stroke_width(ctx, 1);
+      graphics_draw_line(ctx, base, tip);
+    }
+    graphics_context_set_stroke_color(ctx, outline);
+    graphics_context_set_stroke_width(ctx, 1);
+    gpath_draw_outline(ctx, s_hand_path);
+
+    const int16_t hub_r = scale_px(6, face_r);
+    graphics_context_set_fill_color(ctx, GColorWhite);
+    graphics_fill_circle(ctx, c, hub_r);
+    if (s_hand_half_path) {
+      const int32_t pxx = cos_lookup(hand_angle);
+      const int32_t pyy = sin_lookup(hand_angle);
+      graphics_context_set_fill_color(ctx, GColorDarkGray);
+      graphics_fill_circle(ctx,
+        GPoint((int16_t)(c.x - (int32_t)pxx * hub_r / 3 / TRIG_MAX_RATIO),
+               (int16_t)(c.y - (int32_t)pyy * hub_r / 3 / TRIG_MAX_RATIO)),
+        (int16_t)(hub_r * 2 / 3));
+    }
+    graphics_context_set_stroke_color(ctx, outline);
+    graphics_draw_circle(ctx, c, hub_r);
+  } else {
+    const int16_t x = c.x + (int16_t)((int32_t)sin_lookup(hand_angle) * hand_len / TRIG_MAX_RATIO);
+    const int16_t y = c.y - (int16_t)((int32_t)cos_lookup(hand_angle) * hand_len / TRIG_MAX_RATIO);
+    const int32_t pxx = cos_lookup(hand_angle);
+    const int32_t pyy = sin_lookup(hand_angle);
+    const int16_t ox = (int16_t)((int32_t)pxx * 1 / TRIG_MAX_RATIO);
+    const int16_t oy = (int16_t)((int32_t)pyy * 1 / TRIG_MAX_RATIO);
+    graphics_context_set_stroke_width(ctx, 2);
+    graphics_context_set_stroke_color(ctx, GColorWhite);
+    graphics_draw_line(ctx, GPoint((int16_t)(c.x + ox), (int16_t)(c.y + oy)), GPoint((int16_t)(x + ox), (int16_t)(y + oy)));
+    graphics_context_set_stroke_color(ctx, GColorDarkGray);
+    graphics_draw_line(ctx, GPoint((int16_t)(c.x - ox), (int16_t)(c.y - oy)), GPoint((int16_t)(x - ox), (int16_t)(y - oy)));
+    graphics_context_set_fill_color(ctx, GColorWhite);
+    graphics_fill_circle(ctx, c, scale_px(4, face_r));
+  }
+
+  if (display_mode != YES_DISPLAY_MODE_STRICT_MINIMALISM) {
+    char time_buf[12];
+    clock_copy_time_string(time_buf, sizeof(time_buf));
+
+    const int16_t time_h = minimal
+      ? ((min_dim >= 200) ? scale_px(42, face_r) : scale_px(34, face_r))
+      : ((min_dim >= 200) ? scale_px(34, face_r) : scale_px(28, face_r));
+    int16_t y_center;
+    if (minimal) {
+      y_center = (int16_t)(c.y - scale_px(20, face_r));
+    } else {
+      const int16_t ring_center_r = (int16_t)(face_r - (int16_t)moon_inset);
+      const int16_t ring_inner_r = (int16_t)(ring_center_r - (int16_t)(moon_up_thickness / 2));
+      y_center = (int16_t)(c.y - ring_inner_r / 2);
+    }
+
+    const GColor time_col = top_is_night ? GColorWhite : GColorBlack;
+    graphics_context_set_text_color(ctx, time_col);
+    GFont f_time;
+    if (minimal) {
+      const bool use_leco = (min_dim >= 200) && clock_is_24h_style();
+      f_time = fonts_get_system_font(use_leco ? FONT_KEY_LECO_36_BOLD_NUMBERS
+                                              : FONT_KEY_GOTHIC_28_BOLD);
+    } else {
+      f_time = fonts_get_system_font((min_dim >= 200) ? FONT_KEY_GOTHIC_28_BOLD
+                                                      : FONT_KEY_GOTHIC_24_BOLD);
+    }
+
+    const GRect time_rect = GRect(0, (int16_t)(y_center - time_h / 2), bounds.size.w, time_h);
+    graphics_draw_text(ctx, time_buf, f_time,
+                       time_rect,
+                       GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
+  }
+}
+
 void yes_draw_face(Layer *layer, GContext *ctx,
                      bool debug,
                      bool net_on,
@@ -1699,163 +1887,36 @@ void yes_draw_face(Layer *layer, GContext *ctx,
     draw_moon(ctx, moon_c, moon_r, phase, col_solar_night);
   }
 
-  struct tm tm_loc;
-  int minutes = 0;
-  if (!yes_local_tm_now(loc, &tm_loc, &minutes)) minutes = 0;
-
-  const int32_t hand_angle = angle_from_local_minutes_24h(minutes);
-  const int16_t solar_r = (int16_t)(face_r - (int16_t)solar_inset - scale_px(2, face_r));
-  const int16_t hand_margin = minimal ? scale_px(12, face_r) : scale_px(18, face_r);
-  const int16_t hand_len = (int16_t)MIN(solar_r, (int16_t)(face_r - hand_margin));
-
-  // Yes-watch-like tapered arrow hand (filled polygon + subtle outline)
-  if (s_hand_path && hand_len > 16) {
-    const int32_t ux = sin_lookup(hand_angle);
-    const int32_t uy = -cos_lookup(hand_angle);
-    const int32_t px = cos_lookup(hand_angle);
-    const int32_t py = sin_lookup(hand_angle);
-
-    const int16_t base_r = scale_px(4, face_r);
-    const int16_t head_len = scale_px(10, face_r);
-    int16_t neck_r = (int16_t)(hand_len - head_len);
-    if (neck_r < (int16_t)(base_r + scale_px(4, face_r))) neck_r = (int16_t)(base_r + scale_px(4, face_r));
-    const int16_t tip_r  = hand_len;
-
-#ifdef PBL_COLOR
-    const int16_t base_w = scale_px(9, face_r);
-    const int16_t neck_w = scale_px(5, face_r);
-    const GColor outline = GColorDarkGray;
-#else
-    const int16_t base_w = scale_px(7, face_r);
-    const int16_t neck_w = scale_px(4, face_r);
-    const GColor outline = GColorBlack;
-#endif
-
-    const GPoint base = (GPoint){
-      .x = (int16_t)(c.x + (int32_t)ux * base_r / TRIG_MAX_RATIO),
-      .y = (int16_t)(c.y + (int32_t)uy * base_r / TRIG_MAX_RATIO),
-    };
-    const GPoint neck = (GPoint){
-      .x = (int16_t)(c.x + (int32_t)ux * neck_r / TRIG_MAX_RATIO),
-      .y = (int16_t)(c.y + (int32_t)uy * neck_r / TRIG_MAX_RATIO),
-    };
-    const GPoint tip = (GPoint){
-      .x = (int16_t)(c.x + (int32_t)ux * tip_r / TRIG_MAX_RATIO),
-      .y = (int16_t)(c.y + (int32_t)uy * tip_r / TRIG_MAX_RATIO),
-    };
-
-    const int16_t bdx = (int16_t)((int32_t)px * (base_w / 2) / TRIG_MAX_RATIO);
-    const int16_t bdy = (int16_t)((int32_t)py * (base_w / 2) / TRIG_MAX_RATIO);
-    const int16_t ndx = (int16_t)((int32_t)px * (neck_w / 2) / TRIG_MAX_RATIO);
-    const int16_t ndy = (int16_t)((int32_t)py * (neck_w / 2) / TRIG_MAX_RATIO);
-
-    s_hand_points[0] = GPoint(base.x + bdx, base.y + bdy);
-    s_hand_points[1] = GPoint(neck.x + ndx, neck.y + ndy);
-    s_hand_points[2] = tip;
-    s_hand_points[3] = GPoint(neck.x - ndx, neck.y - ndy);
-    s_hand_points[4] = GPoint(base.x - bdx, base.y - bdy);
-
-    s_hand_path->num_points = (uint32_t)(sizeof(s_hand_points) / sizeof(s_hand_points[0]));
-    s_hand_path->rotation = 0;
-    s_hand_path->offset = GPoint(0, 0);
-
-    // Longitudinal split: full white base, then dark half on top (no 1px seam gap).
-    graphics_context_set_fill_color(ctx, GColorWhite);
-    gpath_draw_filled(ctx, s_hand_path);
-    if (s_hand_half_path) {
-      // Dark half includes the centerline (base→tip) so it seals any fill gap.
-      s_hand_half_points[0] = GPoint(base.x - bdx, base.y - bdy);
-      s_hand_half_points[1] = base;
-      s_hand_half_points[2] = tip;
-      s_hand_half_points[3] = GPoint(neck.x - ndx, neck.y - ndy);
-      s_hand_half_path->num_points = 4;
-      s_hand_half_path->rotation = 0;
-      s_hand_half_path->offset = GPoint(0, 0);
-      graphics_context_set_fill_color(ctx, GColorDarkGray);
-      gpath_draw_filled(ctx, s_hand_half_path);
-      // 1px centerline seals residual gaps from integer vertex rounding.
-      graphics_context_set_stroke_color(ctx, GColorDarkGray);
-      graphics_context_set_stroke_width(ctx, 1);
-      graphics_draw_line(ctx, base, tip);
-    }
-    graphics_context_set_stroke_color(ctx, outline);
-    graphics_context_set_stroke_width(ctx, 1);
-    gpath_draw_outline(ctx, s_hand_path);
-
-    const int16_t hub_r = scale_px(6, face_r);
-    graphics_context_set_fill_color(ctx, GColorWhite);
-    graphics_fill_circle(ctx, c, hub_r);
-    // Dark half of hub on the -perp side
-    if (s_hand_half_path) {
-      const int16_t hx = (int16_t)((int32_t)(-px) * hub_r / TRIG_MAX_RATIO);
-      const int16_t hy = (int16_t)((int32_t)(-py) * hub_r / TRIG_MAX_RATIO);
-      s_hand_half_points[0] = c;
-      s_hand_half_points[1] = GPoint((int16_t)(c.x + hx + (int32_t)(-uy) * hub_r / TRIG_MAX_RATIO / 2),
-                                      (int16_t)(c.y + hy + (int32_t)(ux) * hub_r / TRIG_MAX_RATIO / 2));
-      s_hand_half_points[2] = GPoint((int16_t)(c.x + hx), (int16_t)(c.y + hy));
-      s_hand_half_points[3] = GPoint((int16_t)(c.x + hx + (int32_t)(uy) * hub_r / TRIG_MAX_RATIO / 2),
-                                      (int16_t)(c.y + hy + (int32_t)(-ux) * hub_r / TRIG_MAX_RATIO / 2));
-      // Simpler: small dark circle offset toward -perp
-      graphics_context_set_fill_color(ctx, GColorDarkGray);
-      graphics_fill_circle(ctx,
-        GPoint((int16_t)(c.x - (int32_t)px * hub_r / 3 / TRIG_MAX_RATIO),
-               (int16_t)(c.y - (int32_t)py * hub_r / 3 / TRIG_MAX_RATIO)),
-        (int16_t)(hub_r * 2 / 3));
-    }
-    graphics_context_set_stroke_color(ctx, outline);
-    graphics_draw_circle(ctx, c, hub_r);
-  } else {
-    const int16_t x = c.x + (int16_t)((int32_t)sin_lookup(hand_angle) * hand_len / TRIG_MAX_RATIO);
-    const int16_t y = c.y - (int16_t)((int32_t)cos_lookup(hand_angle) * hand_len / TRIG_MAX_RATIO);
-    const int32_t pxx = cos_lookup(hand_angle);
-    const int32_t pyy = sin_lookup(hand_angle);
-    const int16_t ox = (int16_t)((int32_t)pxx * 1 / TRIG_MAX_RATIO);
-    const int16_t oy = (int16_t)((int32_t)pyy * 1 / TRIG_MAX_RATIO);
-    // White + dark parallel lines ≈ split shaft
-    graphics_context_set_stroke_width(ctx, 2);
-    graphics_context_set_stroke_color(ctx, GColorWhite);
-    graphics_draw_line(ctx, GPoint((int16_t)(c.x + ox), (int16_t)(c.y + oy)), GPoint((int16_t)(x + ox), (int16_t)(y + oy)));
-    graphics_context_set_stroke_color(ctx, GColorDarkGray);
-    graphics_draw_line(ctx, GPoint((int16_t)(c.x - ox), (int16_t)(c.y - oy)), GPoint((int16_t)(x - ox), (int16_t)(y - oy)));
-    graphics_context_set_fill_color(ctx, GColorWhite);
-    graphics_fill_circle(ctx, c, scale_px(4, face_r));
+  const bool use_face_cache = (min_dim >= 200);
+  const bool cache_ok = use_face_cache && s_face_cache_valid && s_face_cache
+      && s_face_cache_min_dim == min_dim
+      && s_face_cache_display_mode == display_mode
+      && s_face_cache_twilight_mode == twilight_mode;
+  if (cache_ok) {
+    graphics_draw_bitmap_in_rect(ctx, s_face_cache, bounds);
+    draw_hand_and_time(ctx, bounds, c, face_r, min_dim, moon_inset, moon_up_thickness,
+                       solar_inset, top_is_night, display_mode, minimal, loc);
+    return;
   }
 
-  // Digital time: Normal/Minimalism only. Strict Minimalism hides it.
-  if (display_mode != YES_DISPLAY_MODE_STRICT_MINIMALISM) {
-    char time_buf[12];
-    clock_copy_time_string(time_buf, sizeof(time_buf));
-
-    const int16_t time_h = minimal
-      ? ((min_dim >= 200) ? scale_px(42, face_r) : scale_px(34, face_r))
-      : ((min_dim >= 200) ? scale_px(34, face_r) : scale_px(28, face_r));
-    int16_t y_center;
-    if (minimal) {
-      y_center = (int16_t)(c.y - scale_px(20, face_r));
-    } else {
-      const int16_t ring_center_r = (int16_t)(face_r - (int16_t)moon_inset);
-      const int16_t ring_inner_r = (int16_t)(ring_center_r - (int16_t)(moon_up_thickness / 2));
-      y_center = (int16_t)(c.y - ring_inner_r / 2);
+  if (use_face_cache && !s_face_cache_valid) {
+    GBitmap *captured = graphics_capture_frame_buffer(ctx);
+    if (captured) {
+      GBitmap *copy = copy_gbitmap(captured);
+      graphics_release_frame_buffer(ctx, captured);
+      if (copy) {
+        if (s_face_cache) gbitmap_destroy(s_face_cache);
+        s_face_cache = copy;
+        s_face_cache_valid = true;
+        s_face_cache_min_dim = min_dim;
+        s_face_cache_display_mode = display_mode;
+        s_face_cache_twilight_mode = twilight_mode;
+      }
     }
-
-    // On both color and B/W: black on day, white on night.
-    const GColor time_col = top_is_night ? GColorWhite : GColorBlack;
-    graphics_context_set_text_color(ctx, time_col);
-    GFont f_time;
-    if (minimal) {
-      const bool use_leco = (min_dim >= 200) && clock_is_24h_style();
-      f_time = fonts_get_system_font(use_leco ? FONT_KEY_LECO_36_BOLD_NUMBERS
-                                              : FONT_KEY_GOTHIC_28_BOLD);
-    } else {
-      f_time = fonts_get_system_font((min_dim >= 200) ? FONT_KEY_GOTHIC_28_BOLD
-                                                      : FONT_KEY_GOTHIC_24_BOLD);
-    }
-
-    const GRect time_rect = GRect(0, (int16_t)(y_center - time_h / 2), bounds.size.w, time_h);
-    graphics_draw_text(ctx, time_buf, f_time,
-                       time_rect,
-                       GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
   }
+
+  draw_hand_and_time(ctx, bounds, c, face_r, min_dim, moon_inset, moon_up_thickness,
+                     solar_inset, top_is_night, display_mode, minimal, loc);
 
   // Corner: top-left is now drawn in the overlay layer (`yes_draw_corners`) so that
   // complication alternation doesn't force a full watchface redraw.

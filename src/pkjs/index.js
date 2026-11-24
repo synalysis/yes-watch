@@ -82,7 +82,12 @@ const State = {
   lastWeatherLoc: null, // {latE6, lonE6}
 
   isSending: false,
-  msgQueue: []
+  msgQueue: [],
+
+  locRequestInFlight: false,
+  pendingLocForce: false,
+  lastAstroSentKey: '',
+  lastAstroSentAtMs: 0
 };
 
 const TIDE_NEAR_COAST_THRESHOLD_M = 50000; // 50 km
@@ -1344,8 +1349,17 @@ function sendAstroForCurrentLocation(latE6, lonE6, tzOffsetMin) {
   const latDeg = latE6 / 1e6;
   const lonDeg = lonE6 / 1e6;
   const useInternet = readUseInternetFromStorage();
+  const ymdInt = ymdIntForOffsetMinutes(tzOffsetMin);
+  const dedupeKey = latE6 + ',' + lonE6 + ',' + ymdInt;
+  const nowMs = Date.now();
+  if (State.lastAstroSentKey === dedupeKey &&
+      (nowMs - (State.lastAstroSentAtMs || 0)) < 60000) {
+    return;
+  }
 
   const sendPayload = (sun, moon) => {
+    State.lastAstroSentKey = dedupeKey;
+    State.lastAstroSentAtMs = Date.now();
     const payload = {};
     payload[KEYS.HOME_SUN_STATE] = sun.state;
     payload[KEYS.HOME_SUNRISE_MIN] = sun.sunriseMin;
@@ -1409,19 +1423,6 @@ function sendLocation(position, force) {
   }
   const locUnix = Math.floor(Date.now() / 1000);
 
-  // Weather/tide should track location even when we geo-fence astro sends.
-  // If the user changes emulator location, we want this to update quickly.
-  maybeSendAltitude(position, coords.latitude, coords.longitude);
-  maybeSendTides(latE6, lonE6, !!force);
-  maybeSendWeather(latE6, lonE6, !!force);
-
-  const payload = {};
-  payload[KEYS.LAT_E6] = latE6;
-  payload[KEYS.LON_E6] = lonE6;
-  payload[KEYS.TZ_OFFSET_MIN] = tzOffsetMin;
-  payload[KEYS.LOC_UNIX] = locUnix;
-  payload[KEYS.USE_INTERNET_FALLBACK] = readUseInternetFromStorage() ? 1 : 0;
-
   State.lastLoc = { latE6: latE6, lonE6: lonE6, tzOffsetMin: tzOffsetMin };
   maybeUpdateLocationLabel(latE6, lonE6);
 
@@ -1431,6 +1432,19 @@ function sendLocation(position, force) {
     maybeSendAstroForDayRollover();
     return;
   }
+
+  if (force) {
+    maybeSendAltitude(position, coords.latitude, coords.longitude);
+    maybeSendTides(latE6, lonE6, true);
+    maybeSendWeather(latE6, lonE6, true);
+  }
+
+  const payload = {};
+  payload[KEYS.LAT_E6] = latE6;
+  payload[KEYS.LON_E6] = lonE6;
+  payload[KEYS.TZ_OFFSET_MIN] = tzOffsetMin;
+  payload[KEYS.LOC_UNIX] = locUnix;
+  payload[KEYS.USE_INTERNET_FALLBACK] = readUseInternetFromStorage() ? 1 : 0;
 
   sendQueued(payload, () => {
     State.lastSentAtMs = Date.now();
@@ -1453,10 +1467,24 @@ function requestLocation(force) {
     return;
   }
 
+  if (State.locRequestInFlight) {
+    if (force) State.pendingLocForce = true;
+    return;
+  }
+
+  State.locRequestInFlight = true;
   State.lastLocRequestAtMs = Date.now();
   navigator.geolocation.getCurrentPosition(
-    (pos) => sendLocation(pos, !!force),
-    () => { /* ignore */ },
+    (pos) => {
+      State.locRequestInFlight = false;
+      const pendingForce = State.pendingLocForce;
+      State.pendingLocForce = false;
+      sendLocation(pos, !!force || pendingForce);
+    },
+    () => {
+      State.locRequestInFlight = false;
+      State.pendingLocForce = false;
+    },
     {
       enableHighAccuracy: false,
       timeout: 15000,
@@ -1806,16 +1834,26 @@ function configHtml(useInternet, unitsMode, uiUpdateIntervalSec, language, displ
 Pebble.addEventListener('ready', () => {
   State.lastLocSent = loadLastLocSent();
   loadTideStationsFromStorage();
-  if (State.lastLocSent && typeof State.lastLocSent.ymd === 'number') {
-    State.lastAstroYmd = State.lastLocSent.ymd | 0;
+  if (State.lastLocSent) {
+    State.lastLoc = {
+      latE6: State.lastLocSent.latE6,
+      lonE6: State.lastLocSent.lonE6,
+      tzOffsetMin: State.lastLocSent.tzOffsetMin
+    };
+    if (typeof State.lastLocSent.ymd === 'number') {
+      State.lastAstroYmd = State.lastLocSent.ymd | 0;
+    }
   }
-  requestLocation(true);
+  // The watch requests location after load; avoid a duplicate forced GPS fetch here.
   sendLanguage();
   sendUseInternetFlag();
   sendUiUpdateInterval();
   sendDisplayMode();
   sendTwilightMode();
   setInterval(maybeRefreshLocation, 10 * 60 * 1000);
+
+  // Lightweight local-day check; uses cached location (no GPS) for midnight astro push.
+  setInterval(maybeSendAstroForDayRollover, 60 * 1000);
 
   // Re-send astro data periodically (handles date rollovers even if GPS doesn't change)
   setInterval(() => {
