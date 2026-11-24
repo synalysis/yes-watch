@@ -952,13 +952,14 @@ static void draw_top_right_date(const CornerCtx *c, bool date_only) {
   int16_t detail_w = (int16_t)(MAX(year_sz.w, weekday_sz.w) + pad_px);
   if (date_w > max_w) date_w = max_w;
   if (detail_w > max_w) detail_w = max_w;
-  const int16_t detail_nudge_up = scale_px(2, c->face_r);
+  const int16_t detail_nudge_down = scale_px(3, c->face_r);
   const int16_t detail_nudge_right = scale_px(2, c->face_r);
   const int16_t right = (int16_t)(c->bounds.size.w - pad);
   const int16_t detail_right = (int16_t)(right + detail_nudge_right);
   const int16_t date_x = (int16_t)(right - date_w);
   const int16_t detail_x = (int16_t)(detail_right - detail_w);
-  const int16_t detail_y = (int16_t)(pad + date_h - scale_px(2, c->face_r) - detail_nudge_up);
+  // Sit just below the date glyph box so year/weekday do not collide with month/day.
+  const int16_t detail_y = (int16_t)(pad + date_h + detail_nudge_down);
 
   graphics_context_set_fill_color(c->ctx, GColorBlack);
   if (!date_only) {
